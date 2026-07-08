@@ -46,6 +46,7 @@ cc_library(
     ],
     deps = [
         "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/meta:types",
     ],
 )
 
@@ -160,4 +161,3 @@ cc_library(
         "//kv_cache_manager/metrics:metrics_lifecycle",
     ],
 )
-

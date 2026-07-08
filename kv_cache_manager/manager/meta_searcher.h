@@ -69,6 +69,11 @@ public:
                                const KeyVector &keys,
                                const BlockMask &input_mask,
                                std::vector<CacheLocationMap> &out_location_maps);
+    ErrorCode BatchGetRawMeta(RequestContext *request_context,
+                              const KeyVector &keys,
+                              CacheLocationMapVector &out_location_maps,
+                              PropertyMapVector &out_properties,
+                              std::vector<ErrorCode> &out_error_codes);
     ErrorCode BatchAddLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
