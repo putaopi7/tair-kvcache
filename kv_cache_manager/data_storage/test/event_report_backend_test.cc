@@ -453,3 +453,78 @@ TEST_F(EventReportBackendTest, TwoInstancesSameHostIsolated) {
 
     ASSERT_EQ(EC_OK, backend.Close());
 }
+
+TEST_F(EventReportBackendTest, SnapshotVersionLifecycleIsFencedPerScope) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+
+    const SnapshotScopeKey mem_scope{"instance_a", "10.0.0.60:8080", "mem"};
+    const SnapshotScopeKey disk_scope{"instance_a", "10.0.0.60:8080", "disk"};
+    EXPECT_EQ(1u, backend.AllocateSnapshotVersion(mem_scope));
+    EXPECT_EQ(0u, backend.AllocateSnapshotVersion(mem_scope));
+    EXPECT_EQ(1u, backend.AllocateSnapshotVersion(disk_scope));
+
+    EXPECT_FALSE(backend.CommitSnapshotVersion(mem_scope, 2));
+    EXPECT_TRUE(backend.CommitSnapshotVersion(mem_scope, 1));
+    EXPECT_EQ(1u, backend.GetSnapshotVersion(mem_scope));
+    EXPECT_TRUE(backend.CommitSnapshotVersion(disk_scope, 1));
+
+    EXPECT_EQ(2u, backend.AllocateSnapshotVersion(mem_scope));
+    backend.AbortSnapshotVersion(mem_scope, 2);
+    EXPECT_EQ(3u, backend.AllocateSnapshotVersion(mem_scope));
+    EXPECT_TRUE(backend.CommitSnapshotVersion(mem_scope, 3));
+
+    const SnapshotScopeKey recovered_scope{"instance_b", "10.0.0.61:8080", "hbm"};
+    backend.ObserveSnapshotVersion(recovered_scope, 8);
+    EXPECT_EQ(8u, backend.GetSnapshotVersion(recovered_scope));
+    EXPECT_EQ(9u, backend.AllocateSnapshotVersion(recovered_scope));
+    EXPECT_TRUE(backend.CommitSnapshotVersion(recovered_scope, 9));
+
+    std::string medium;
+    std::string host;
+    EXPECT_TRUE(backend.ParseLocationId(backend.BuildLocationId("hbm", "10.0.0.61:8080"), medium, host));
+    EXPECT_EQ("hbm", medium);
+    EXPECT_EQ("10.0.0.61:8080", host);
+    EXPECT_FALSE(backend.ParseLocationId("kvs#event_report#hbm", medium, host));
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(EventReportBackendTest, MightExistRequiresCommittedVersionAndAuthoritativeReporterHost) {
+    EventReportBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+
+    const SnapshotScopeKey scope{"instance_a", "10.0.0.70:8080", "mem"};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(scope.instance_id, scope.host_ip_port, {scope.medium}));
+    const uint64_t version1 = backend.AllocateSnapshotVersion(scope);
+    ASSERT_EQ(1u, version1);
+
+    std::string uri1;
+    ASSERT_TRUE(AddSnapshotVersionToUri("event_report://physical-storage.example:9600/cache/1", scope, version1, uri1));
+    EXPECT_EQ(std::vector<bool>({false}), backend.MightExist({DataStorageUri(uri1)}));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(scope, version1));
+    EXPECT_EQ(std::vector<bool>({true}), backend.MightExist({DataStorageUri(uri1)}));
+
+    const uint64_t version2 = backend.AllocateSnapshotVersion(scope);
+    std::string uri2;
+    ASSERT_TRUE(AddSnapshotVersionToUri("event_report://physical-storage.example:9600/cache/1", scope, version2, uri2));
+    EXPECT_EQ(std::vector<bool>({false}), backend.MightExist({DataStorageUri(uri2)}));
+    EXPECT_EQ(std::vector<bool>({true}), backend.MightExist({DataStorageUri(uri1)}));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(scope, version2));
+    EXPECT_EQ(std::vector<bool>({false}), backend.MightExist({DataStorageUri(uri1)}));
+    EXPECT_EQ(std::vector<bool>({true}), backend.MightExist({DataStorageUri(uri2)}));
+
+    SnapshotUriInfo parsed;
+    ASSERT_TRUE(ParseSnapshotUriInfo(uri2, parsed));
+    EXPECT_TRUE(scope == parsed.scope);
+    EXPECT_EQ(version2, parsed.version);
+
+    const SnapshotScopeKey other_instance{"instance_b", scope.host_ip_port, scope.medium};
+    backend.ObserveSnapshotVersion(other_instance, version2);
+    std::string other_uri;
+    ASSERT_TRUE(AddSnapshotVersionToUri(
+        "event_report://physical-storage.example:9600/cache/1", other_instance, version2, other_uri));
+    EXPECT_EQ(std::vector<bool>({false}), backend.MightExist({DataStorageUri(other_uri)}));
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}

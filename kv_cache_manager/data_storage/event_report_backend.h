@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
+#include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -63,7 +64,14 @@ public:
     uint64_t GetNodeGeneration(const std::string &instance_id, const std::string &host_ip_port) const;
 
     std::string BuildLocationId(const std::string &medium, const std::string &host_ip_port) const;
+    bool ParseLocationId(const std::string &location_id, std::string &out_medium, std::string &out_host_ip_port) const;
     std::string HostSuffix(const std::string &host_ip_port) const;
+    // Returns 0 while another snapshot for the same scope is in flight.
+    uint64_t AllocateSnapshotVersion(const SnapshotScopeKey &scope);
+    bool CommitSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
+    void AbortSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
+    void ObserveSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
+    uint64_t GetSnapshotVersion(const SnapshotScopeKey &scope) const;
     DataStorageType GetStorageType() const;
 
 private:
@@ -94,6 +102,12 @@ private:
     // Persists across unregister/register to fence stale cleanup.
     // instance_id -> (host_ip_port -> generation)
     std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> node_generation_;
+    struct SnapshotVersionState {
+        uint64_t allocated = 0;
+        uint64_t committed = 0;
+        uint64_t in_flight = 0;
+    };
+    std::unordered_map<SnapshotScopeKey, SnapshotVersionState, SnapshotScopeKeyHash> snapshot_versions_;
 
     std::thread liveness_checker_thread_;
     std::atomic<bool> liveness_checker_running_{false};

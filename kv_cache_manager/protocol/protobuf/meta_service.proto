@@ -53,10 +53,9 @@ enum StorageType {
 // normalizes engine-specific cache signals (for example RTP-LLM full cache
 // snapshots or vLLM KV events) into block-level mutations on one storage
 // system. `storage_type` names that large storage/cache system; `medium`
-// identifies one diffable cache namespace under the reporter host; LocationSpec
-// describes where each cache component of the block lives. KVCM currently
-// matches only full-attention specs and ignores mamba-state specs by
-// LocationSpec.name.
+// identifies one independently reconcilable cache namespace under the reporter
+// host; LocationSpec describes every cache component of the block, including
+// full-attention and mamba-state specs.
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
@@ -82,18 +81,19 @@ message BlockAddEventParams {
 message BlockDeleteEventParams {
     string block_key = 1;
     string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
-    // Optional. When set, KVCM applies the delete only if these component names
-    // contain a full-attention spec; mamba-state-only deletes are ignored.
+    // Required component names to remove from this block location.
     repeated string spec_names = 3;
 }
 
 message BlockSnapshotItem {
     string block_key = 1;
-    repeated LocationSpec specs = 2;
+    repeated LocationSpec specs = 2; // complete spec set for this block location
 }
 
 message BlockSnapshotEventParams {
     string medium = 1; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    // Complete block set for instance_id + reporter host_ip_port + medium.
+    // Empty means the scope owns no blocks. Do not paginate.
     repeated BlockSnapshotItem blocks = 2;
 }
 

@@ -171,6 +171,28 @@ def _ev_block_delete(block_key, medium, spec_names):
     }
 
 
+def _ev_block_snapshot(medium, blocks):
+    """Build an authoritative snapshot for one reporter host/medium scope.
+
+    Args:
+        blocks: list of {"block_key": ..., "specs": [...]} dicts. The list and
+            every specs list must be complete, not a page or delta.
+    """
+    return {
+        "event_type": "EVENT_BLOCK_SNAPSHOT",
+        "block_snapshot": {
+            "medium": medium,
+            "blocks": [
+                {
+                    "block_key": str(block["block_key"]),
+                    "specs": list(block["specs"]),
+                }
+                for block in blocks
+            ],
+        },
+    }
+
+
 def _ev_host_down():
     return {"event_type": "EVENT_HOST_DOWN", "host_down": {}}
 
@@ -193,8 +215,8 @@ def _make_request(instance_id, host_ip_port, events, trace_id="test", storage_ty
 
 
 def _build_event_report_uri(host_ip_port, medium, params=None):
-    """Build vineyard URI: vineyard://{ip}:{port}/{medium}?k=v&..."""
-    base = f"vineyard://{host_ip_port}/{medium}"
+    """Build event-report URI: event_report://{ip}:{port}/{medium}?k=v&..."""
+    base = f"event_report://{host_ip_port}/{medium}"
     if not params:
         return base
     query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
@@ -801,6 +823,82 @@ class EventReportFunctionalTest(unittest.TestCase):
                 actual[host], prefix,
                 f"host {host}: expected prefix={prefix}, got {actual[host]}",
             )
+
+    # 17. Snapshot is a complete reconciliation barrier and supports empty clear.
+    def test_17_snapshot_reconciliation_contract(self):
+        host = "192.168.1.240:8080"
+        physical_host = "10.10.10.10:9600"
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_node_register(["mem"])],
+                trace_id="t17_register",
+            )
+        )
+
+        snapshot = _ev_block_snapshot("mem", [
+            {
+                "block_key": 9301,
+                "specs": [
+                    {"name": "linear_0", "uri": _build_event_report_uri(physical_host, "mem")},
+                    {"name": "full_3", "uri": _build_event_report_uri(physical_host, "mem")},
+                ],
+            },
+            {
+                "block_key": 9302,
+                "specs": _make_single_spec(
+                    "linear_0", _build_event_report_uri(physical_host, "mem")
+                ),
+            },
+        ])
+        self.client.report_event(
+            _make_request(self.instance_id, host, [snapshot], trace_id="t17_snapshot")
+        )
+
+        resp = self.client.get_cache_location({
+            "trace_id": "t17_query",
+            "instance_id": self.instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [9301],
+            "block_mask": {"offset": 0},
+        })
+        specs = resp.get("locations", [{}])[0].get("location_specs", [])
+        self.assertEqual({"linear_0", "full_3"}, {spec.get("name") for spec in specs})
+        for spec in specs:
+            uri = spec.get("uri", "")
+            self.assertIn("kvcm_snapshot_version=", uri)
+            self.assertIn("kvcm_host_ip_port=", uri)
+
+        # Snapshot and delta mutations must be separate ordered requests.
+        mixed = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [
+                    _ev_block_snapshot("mem", []),
+                    _ev_block_add(
+                        9303,
+                        "mem",
+                        _make_single_spec("linear_0", _build_event_report_uri(physical_host, "mem")),
+                    ),
+                ],
+                trace_id="t17_mixed_rejected",
+            ),
+            check_ok=False,
+        )
+        mixed_code = mixed.get("header", {}).get("status", {}).get("code")
+        self.assertNotIn(mixed_code, ("OK", 1, "1", None))
+
+        # Empty snapshot authoritatively clears this reporter scope.
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_snapshot("mem", [])],
+                trace_id="t17_empty_snapshot",
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

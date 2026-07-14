@@ -88,6 +88,16 @@ public:
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
                                std::vector<std::string> &out_location_ids);
+    struct ReplaceLocationSpecsTask {
+        std::string location_id;
+        DataStorageType type;
+        CacheLocationStatus status;
+        std::vector<LocationSpec> specs;
+    };
+    ErrorCode BatchReplaceLocationSpecs(RequestContext *request_context,
+                                        const KeyVector &keys,
+                                        const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
+                                        std::vector<ErrorCode> &out_per_key_ec);
     struct MergeLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
@@ -135,6 +145,16 @@ public:
                                    const KeyVector &keys,
                                    const LocationIdsPerKey &location_ids_per_key,
                                    std::vector<std::vector<ErrorCode>> &out_per_location_ec);
+    using LocationVisitor =
+        std::function<void(KeyType block_key, const std::string &location_id, const CacheLocation &location)>;
+    ErrorCode VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor);
+    using LocationCleanupPredicate =
+        std::function<bool(KeyType block_key, const std::string &location_id, const CacheLocation &location)>;
+    ErrorCode CleanupLocationsByPredicate(RequestContext *request_context,
+                                          DataStorageType storage_type,
+                                          size_t scan_batch_size,
+                                          LocationCleanupPredicate should_delete,
+                                          std::function<bool()> should_abort = nullptr);
     ErrorCode CleanupLocationsByHost(RequestContext *request_context,
                                      const std::string &host_suffix,
                                      DataStorageType storage_type,

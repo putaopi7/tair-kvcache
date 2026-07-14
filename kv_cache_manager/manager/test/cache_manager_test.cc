@@ -3315,6 +3315,178 @@ TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
     }
 }
 
+TEST_F(CacheManagerTest, TestReportEventSnapshotReconcilesAndFencesIncrementalUpdates) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_report_event_snapshot";
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               {LocationSpecInfo("linear_0", 512), LocationSpecInfo("full_3", 512)},
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto event_backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+    StorageConfig cfg;
+    cfg.set_global_unique_name("event_backend_snapshot");
+    cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+    ASSERT_EQ(EC_OK, event_backend->Open(cfg, "test_trace"));
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_snapshot"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_backend_snapshot"});
+
+    const std::string host = "10.0.0.20:8080";
+    const std::string medium = "mem";
+    auto report_register = [&]() {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        auto *event = req.add_events();
+        event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        event->mutable_node_register()->add_mediums(medium);
+        proto::meta::ReportEventResponse resp;
+        return cache_manager_->ReportEvent(request_context_.get(), &req, &resp);
+    };
+    auto report_add = [&](int64_t key, const std::vector<LocationSpec> &specs) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        auto *event = req.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *params = event->mutable_block_add();
+        params->set_block_key(std::to_string(key));
+        params->set_medium(medium);
+        for (const auto &input_spec : specs) {
+            auto *spec = params->add_specs();
+            spec->set_name(input_spec.name());
+            spec->set_uri(input_spec.uri());
+        }
+        proto::meta::ReportEventResponse resp;
+        return cache_manager_->ReportEvent(request_context_.get(), &req, &resp);
+    };
+    auto report_snapshot = [&](const std::vector<std::pair<int64_t, std::vector<LocationSpec>>> &blocks) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        auto *event = req.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+        auto *params = event->mutable_block_snapshot();
+        params->set_medium(medium);
+        for (const auto &[key, input_specs] : blocks) {
+            auto *block = params->add_blocks();
+            block->set_block_key(std::to_string(key));
+            for (const auto &input_spec : input_specs) {
+                auto *spec = block->add_specs();
+                spec->set_name(input_spec.name());
+                spec->set_uri(input_spec.uri());
+            }
+        }
+        proto::meta::ReportEventResponse resp;
+        return cache_manager_->ReportEvent(request_context_.get(), &req, &resp);
+    };
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, meta_searcher);
+    auto get_location_map = [&](int64_t key) {
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask = static_cast<size_t>(0);
+        EXPECT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+        EXPECT_EQ(1u, location_maps.size());
+        return location_maps.empty() ? CacheLocationMap() : location_maps[0];
+    };
+    auto wait_until_location_count = [&](int64_t key, size_t expected_count) {
+        CacheLocationMap locations;
+        for (int i = 0; i < 100; ++i) {
+            locations = get_location_map(key);
+            if (locations.size() == expected_count) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return locations;
+    };
+
+    ASSERT_EQ(EC_OK, report_register());
+    const int64_t retained_key = 9201;
+    const int64_t omitted_key = 9202;
+    ASSERT_EQ(EC_OK,
+              report_add(retained_key,
+                         {LocationSpec("linear_0", "event_report://physical-a:9600/cache/9201"),
+                          LocationSpec("full_3", "event_report://physical-a:9600/cache/9201")}));
+    ASSERT_EQ(EC_OK, report_add(omitted_key, {LocationSpec("linear_0", "event_report://physical-b:9600/cache/9202")}));
+
+    ASSERT_EQ(EC_OK,
+              report_snapshot({{retained_key,
+                                {LocationSpec("linear_0", "event_report://physical-a:9600/cache/9201"),
+                                 LocationSpec("full_3", "event_report://physical-a:9600/cache/9201")}}}));
+    auto omitted_locations = wait_until_location_count(omitted_key, 0);
+    EXPECT_TRUE(omitted_locations.empty());
+
+    const std::string location_id = event_backend->BuildLocationId(medium, host);
+    auto retained_locations = get_location_map(retained_key);
+    ASSERT_EQ(1u, retained_locations.size());
+    ASSERT_TRUE(retained_locations.at(location_id));
+    ASSERT_EQ(2u, retained_locations.at(location_id)->location_specs().size());
+    for (const auto &spec : retained_locations.at(location_id)->location_specs()) {
+        SnapshotUriInfo info;
+        ASSERT_TRUE(ParseSnapshotUriInfo(spec.uri(), info));
+        EXPECT_EQ(instance_id, info.scope.instance_id);
+        EXPECT_EQ(host, info.scope.host_ip_port);
+        EXPECT_EQ(medium, info.scope.medium);
+        EXPECT_EQ(1u, info.version);
+    }
+
+    // A later full snapshot replaces all specs for a reported block.
+    ASSERT_EQ(
+        EC_OK,
+        report_snapshot({{retained_key, {LocationSpec("linear_0", "event_report://physical-a:9600/cache/9201")}}}));
+    retained_locations = get_location_map(retained_key);
+    ASSERT_EQ(1u, retained_locations.size());
+    ASSERT_EQ(1u, retained_locations.at(location_id)->location_specs().size());
+    EXPECT_EQ("linear_0", retained_locations.at(location_id)->location_specs().front().name());
+
+    // Incremental updates after the snapshot inherit its committed version and
+    // merge with current specs instead of reviving obsolete ones.
+    ASSERT_EQ(EC_OK, report_add(retained_key, {LocationSpec("full_3", "event_report://physical-a:9600/cache/9201")}));
+    retained_locations = get_location_map(retained_key);
+    ASSERT_EQ(2u, retained_locations.at(location_id)->location_specs().size());
+    for (const auto &spec : retained_locations.at(location_id)->location_specs()) {
+        SnapshotUriInfo info;
+        ASSERT_TRUE(ParseSnapshotUriInfo(spec.uri(), info));
+        EXPECT_EQ(2u, info.version);
+    }
+
+    // A snapshot request is a mutation barrier and cannot be mixed with deltas.
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        auto *snapshot = req.add_events();
+        snapshot->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+        snapshot->mutable_block_snapshot()->set_medium(medium);
+        auto *add = req.add_events();
+        add->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        add->mutable_block_add()->set_block_key("9203");
+        add->mutable_block_add()->set_medium(medium);
+        auto *spec = add->mutable_block_add()->add_specs();
+        spec->set_name("linear_0");
+        spec->set_uri("event_report://physical-c:9600/cache/9203");
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_BADARGS, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, resp.header().status().code());
+    }
+
+    ASSERT_EQ(EC_OK, report_snapshot({}));
+    retained_locations = wait_until_location_count(retained_key, 0);
+    EXPECT_TRUE(retained_locations.empty());
+}
+
 // =============================================================
 // GetCacheLocationsByBackend with backend_selectors
 // =============================================================

@@ -3,14 +3,18 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
@@ -30,6 +34,7 @@ class ReclaimerTaskSupervisor;
 class StartupConfigLoader;
 class EventManager;
 class CacheManagerMetricsRecorder;
+class EventReportBackend;
 struct MetricsLifecycle;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 
@@ -260,6 +265,18 @@ private:
                               const std::string &host_ip_port,
                               uint64_t cleanup_generation,
                               DataStorageType storage_type);
+    void CleanupStaleSnapshotLocations(const SnapshotScopeKey &scope,
+                                       uint64_t snapshot_version,
+                                       DataStorageType storage_type,
+                                       const std::shared_ptr<EventReportBackend> &event_backend);
+    void ScheduleStaleSnapshotCleanup(const SnapshotScopeKey &scope,
+                                      uint64_t snapshot_version,
+                                      DataStorageType storage_type,
+                                      std::shared_ptr<EventReportBackend> event_backend);
+    void RunStaleSnapshotCleanup(const SnapshotScopeKey &scope);
+    ErrorCode RecoverEventSnapshotVersions(RequestContext *request_context,
+                                           const std::string &instance_id,
+                                           MetaSearcher *meta_searcher);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,
@@ -327,6 +344,17 @@ private:
     // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
     std::thread recover_retry_thread_;
     std::atomic<bool> recover_retry_stop_{false};
+    // 需要清理 - event snapshot 版本表由 event backend 内存维护，恢复扫描只需每个 instance 做一次
+    std::mutex snapshot_version_recovery_mutex_;
+    std::set<std::string> snapshot_version_recovered_instances_;
+    struct SnapshotCleanupState {
+        uint64_t latest_version = 0;
+        DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+        std::shared_ptr<EventReportBackend> event_backend;
+    };
+    // 需要清理 - 同一 snapshot scope 最多保留一个后台扫描任务，连续版本合并到最新值
+    std::mutex snapshot_cleanup_mutex_;
+    std::unordered_map<SnapshotScopeKey, SnapshotCleanupState, SnapshotScopeKeyHash> snapshot_cleanup_states_;
 };
 
 } // namespace kv_cache_manager
