@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LiteHit 核心算法详解</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #171d24;
+    --panel2: #1d2530;
+    --text: #d8dee6;
+    --muted: #8b98a8;
+    --accent: #4fc3f7;
+    --accent2: #81c784;
+    --warn: #ffb74d;
+    --border: #2a3441;
+    --code-bg: #10161d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font-family: "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+    line-height: 1.75; font-size: 15px;
+  }
+  .container { max-width: 960px; margin: 0 auto; padding: 32px 24px 96px; }
+  header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 24px; margin-bottom: 32px;
+  }
+  h1 { font-size: 30px; margin: 0 0 8px; color: #fff; }
+  .subtitle { color: var(--muted); font-size: 15px; }
+  .subtitle code { color: var(--accent); }
+  h2 {
+    font-size: 21px; color: var(--accent);
+    margin: 48px 0 16px; padding-top: 16px;
+    border-top: 1px dashed var(--border);
+  }
+  h3 { font-size: 16px; color: #e8eef5; margin: 28px 0 10px; }
+  p { margin: 10px 0; }
+  code {
+    font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 1px 6px; font-size: 13px; color: #9ecbff;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 18px; overflow-x: auto;
+    font-size: 13px; line-height: 1.6;
+  }
+  pre code { background: none; border: none; padding: 0; color: #c9d6e3; }
+  .kw { color: #ff8a80; }
+  .fn { color: #82aaff; }
+  .cm { color: #616e7d; }
+  .num { color: #f0c674; }
+  table {
+    border-collapse: collapse; width: 100%; margin: 16px 0;
+    font-size: 14px;
+  }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; }
+  th { background: var(--panel2); color: #e8eef5; }
+  td { background: var(--panel); }
+  .callout {
+    background: var(--panel); border-left: 4px solid var(--accent);
+    border-radius: 0 8px 8px 0; padding: 12px 18px; margin: 18px 0;
+  }
+  .callout.green { border-left-color: var(--accent2); }
+  .callout.orange { border-left-color: var(--warn); }
+  .callout .title { font-weight: 600; color: #fff; margin-bottom: 4px; }
+  .flow {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px; margin: 20px 0;
+    text-align: center;
+  }
+  .flow .step {
+    display: inline-block; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 22px; margin: 4px; color: #e8eef5; font-size: 14px;
+  }
+  .flow .arrow { color: var(--accent); margin: 2px 0; font-size: 13px; }
+  .flow .arrow em { color: var(--muted); font-style: normal; font-size: 12px; }
+  .lru-stack { display: flex; justify-content: center; gap: 8px; margin: 16px 0; flex-wrap: wrap; }
+  .lru-block {
+    width: 64px; height: 64px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel2); font-family: monospace;
+  }
+  .lru-block .k { font-size: 18px; color: #fff; font-weight: 700; }
+  .lru-block .d { font-size: 11px; color: var(--muted); }
+  .lru-block.c1 { border-color: #4fc3f7; box-shadow: 0 0 0 1px #4fc3f755; }
+  .toc {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 28px; margin: 24px 0;
+  }
+  .toc ol { margin: 6px 0; padding-left: 20px; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .src { color: var(--muted); font-size: 12.5px; }
+  footer { margin-top: 64px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--border); padding-top: 16px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>LiteHit 核心算法详解</h1>
+  <div class="subtitle">
+    一次回放，精确计算多个 LRU 容量下的 Prefix 命中率<br>
+    源码：<code>kv_cache_manager/optimizer/liteHit/</code>（<code>lite_hit.cc</code> / <code>dynamic_fenwick_tree.cc</code>）
+  </div>
+</header>
+
+<div class="toc">
+  <strong>目录</strong>
+  <ol>
+    <li><a href="#s0">要解决的问题</a></li>
+    <li><a href="#s1">理论基础：LRU 栈包含性质</a></li>
+    <li><a href="#s2">Reuse Distance 与 Fenwick 树</a></li>
+    <li><a href="#s3">从独立命中到 Prefix 命中</a></li>
+    <li><a href="#s4">容量维度差分</a></li>
+    <li><a href="#s5">两阶段处理：快照评估 + 批量提交</a></li>
+    <li><a href="#s6">内存控制：剪枝与压缩</a></li>
+    <li><a href="#s7">Token 命中率换算</a></li>
+    <li><a href="#s8">端到端算例</a></li>
+    <li><a href="#s9">复杂度与整体流程</a></li>
+  </ol>
+</div>
+
+<h2 id="s0">0. 要解决的问题</h2>
+<p>给定一段带请求边界的 KVCache block 访问 trace，和一组候选缓存容量（如 1GB / 2GB / 4GB / 无限），问：<strong>每个容量下的 prefix 命中率各是多少？</strong>用于回答“缓存扩容到多大收益如何”这类容量规划问题。</p>
+<div class="callout orange">
+  <div class="title">朴素做法为什么不行</div>
+  为 K 个容量各维护一套真实 LRU，回放 K 遍（或一遍内更新 K 套链表）——时间和内存都是 K 倍，容量点一多就不可行。
+</div>
+<p>LiteHit 的目标：<strong>只维护一套状态、回放一遍，精确（非近似）得到所有容量的结果。</strong>第一阶段约束：full attention、等 charge block、精确 LRU、容量集合开始时固定，支持 0 / 有限 / 无限容量。</p>
+
+<h2 id="s1">1. 理论基础：LRU 栈包含性质（Stack Inclusion）</h2>
+<p>这是整个算法的支点：</p>
+<div class="callout">
+  <div class="title">栈包含性质</div>
+  容量为 C 的 LRU 缓存内容，恰好是“全局按最近访问时间排序”这条序列的<strong>前 C 个元素</strong>。小容量缓存永远是大容量缓存的子集。
+</div>
+<p>例：全局最近访问顺序为 <code>MRU → [X, A, Y, B] → LRU</code>：</p>
+<div class="lru-stack">
+  <div class="lru-block c1"><span class="k">X</span><span class="d">深度 1</span></div>
+  <div class="lru-block c1"><span class="k">A</span><span class="d">深度 2</span></div>
+  <div class="lru-block c1"><span class="k">Y</span><span class="d">深度 3</span></div>
+  <div class="lru-block c1"><span class="k">B</span><span class="d">深度 4</span></div>
+</div>
+<pre><code>容量 1 的缓存 = {X}
+容量 2 的缓存 = {X, A}
+容量 3 的缓存 = {X, A, Y}
+容量 4 的缓存 = {X, A, Y, B}</code></pre>
+<p>所以 K 套 LRU 缓存其实是<strong>同一条全局顺序的 K 个前缀</strong>——只要维护这一条全局顺序，就能同时回答所有容量。</p>
+<div class="callout green">
+  <div class="title">推论：最小命中容量</div>
+  某次访问 block B 时，若 B 在全局 LRU 序中排第 p 位，则它在容量 <code>C ≥ p</code> 时命中、<code>C &lt; p</code> 时 miss。p 就是这次访问的 <code>required_capacity</code>。
+</div>
+
+<h2 id="s2">2. Reuse Distance 与 Fenwick 树</h2>
+<h3>2.1 reuse distance</h3>
+<p>block 在全局 LRU 序中的深度，等价于：</p>
+<pre><code>reuse distance d = 该 block 上次访问之后、这次访问之前，
+                   出现过的【不同】block 数
+required_capacity = d + 1</code></pre>
+<p>第一次出现的 block 是 <strong>cold miss</strong>，没有有限的 required_capacity——无限容量也救不了 cold miss。</p>
+
+<h3>2.2 Fenwick 树怎么算 d</h3>
+<p>直接数“区间内不同 block 数”很贵。经典技巧（Bennett–Kruskal / Mattson 算法一脉）是：</p>
+<ul>
+  <li>给每次访问分配递增的<strong>位置序号</strong>；每个 block 只保留<strong>最新位置</strong>（<code>last_positions_</code>）；</li>
+  <li>Fenwick 逻辑数组：<code>marker[pos] = 1</code> 当且仅当 pos 是某个 block 的最新位置，否则为 0。</li>
+</ul>
+<p>于是“区间 <code>(prev, now]</code> 内仍为 1 的位置数”就等于“比当前 block 更新的不同 block 数”：</p>
+<pre><code><span class="cm">// lite_hit.cc — ReuseDistance</span>
+d = fenwick.<span class="fn">PrefixSum</span>(size) - fenwick.<span class="fn">PrefixSum</span>(prev);</code></pre>
+<p>block 更新位置时，把旧位置的 1 清掉、新位置标 1，保证“每个活跃 block 恰好贡献一个 1”。单次操作 <code>O(log n)</code>。</p>
+<div class="callout orange">
+  <div class="title">Fenwick 不是缓存</div>
+  它不是一套 cache，也不是额外的 LRU 链，只是全局 LRU 顺序的 <strong>order-statistics 视图</strong>。
+</div>
+<p><code>DynamicFenwickTree</code> 是可追加的变体：<code>AppendZero()</code> 在末尾加一个逻辑 0，并用当前前缀和给新树节点播种，使后续 <code>Add</code> 保持所有祖先节点一致——避免预分配整个 trace 长度的数组。</p>
+
+<h2 id="s3">3. 从独立命中到 Prefix 命中</h2>
+<p>full-attention 的语义是<strong>前缀命中</strong>：请求 <code>[A, B, C, D]</code> 中如果 C miss，即使 D 独立看是 hit，也不能贡献命中（推理必须从第一个 miss 处开始重算）。</p>
+<pre><code>请求 block：   [A,   B,   C,    D  ]
+独立判断：      hit  hit  miss  hit
+本条请求结果：  hit_count = 2       <span class="cm">← D 不能越过 C</span></code></pre>
+<p>设请求内各 block 的最小命中容量为 <code>[r1, r2, ..., rm]</code>，第 j 个 block 贡献 prefix hit 需要容量满足前面<strong>所有</strong> block：</p>
+<pre><code>prefix_required[j] = max(r1, r2, ..., rj)     <span class="cm">← running max</span></code></pre>
+<p>实现见 <code>EvaluateRequestPrefix</code>（lite_hit.cc:108）：逐 block 维护 running max；遇到首个 cold block 直接 <code>break</code>——cold 对任何容量（含无限）都截断 prefix。</p>
+<div class="callout">
+  <div class="title">关键点：miss 截断计数，但不停止状态更新</div>
+  首个 miss 只截断本条请求的 <code>hit_count</code>。所有完整 block 仍按序进入/刷新全局 LRU（否则下一条请求看到的缓存状态就错了）。这正是“评估”和“提交”分离的原因（见第 5 节）。
+</div>
+
+<h2 id="s4">4. 容量维度差分：一次访问不逐容量记账</h2>
+<p>有了门槛 <code>prefix_required[j] = R</code>，意味着该 block 对<strong>所有 C ≥ R 的容量</strong>各贡献一次命中。逐容量 +1 又回到 O(K)。LiteHit 用差分数组 <code>hit_deltas_</code>：</p>
+<ul>
+  <li>初始化时把有限容量<strong>排序去重</strong>，无限容量排在最后；</li>
+  <li>每个门槛 R 只在“第一个 ≥ R 的容量”处 +1，二分查找 <code>O(log K)</code>（<code>FirstCapacityAtLeast</code>）；</li>
+  <li>输出时沿容量从小到大做一次<strong>前缀和</strong>（<code>ResolveHitDeltas</code>），再映射回用户原始输入顺序（含重复容量）。</li>
+</ul>
+<p>例：容量 <code>[1, 2, 4, ∞]</code>，某请求门槛为 <code>[2, 4, 4]</code>：</p>
+<pre><code>容量：       [1,  2,  4,  ∞]
+gain（差分）：[0,  1,  2,  0]   <span class="cm">← R=2 落在容量2；两个 R=4 落在容量4</span>
+前缀和 →
+hit_count：  [0,  1,  3,  3]</code></pre>
+
+<h2 id="s5">5. 两阶段处理：快照评估 + 批量提交</h2>
+<p><code>ProcessRequest</code> 不逐 block 交替“查询 + 更新”，而是分两阶段：</p>
+
+<h3>阶段一：只读快照评估（EvaluateRequestPrefix）</h3>
+<p>基于<strong>请求到达前</strong>的 LRU 快照，为请求中每个不同 key 查一次深度；重复 key 复用同一快照条目。</p>
+<div class="callout green">
+  <div class="title">为什么快照评估是合法的</div>
+  对任意容量，首个 miss 之前全是 hit，而 <strong>hit 只改变顺序、不改变缓存成员集合</strong>。所以“首个 miss 的位置”只取决于请求前的快照，与请求内前面的 hit 如何刷新顺序无关。
+</div>
+
+<h3>阶段二：批量提交（CommitRequest）</h3>
+<p>按每个不同 key 的<strong>最后一次出现</strong>顺序提交：先把这些 key 的旧 marker 全部清 0，再按请求内最后出现的先后顺序追加新位置（越晚出现越靠近 MRU）。这与逐 block 顺序访问的最终状态严格等价：</p>
+<pre><code>旧 LRU: [X, A, B, C]，请求 [A, B, A]
+
+顺序访问：A→[A,X,B,C]  B→[B,A,X,C]  A→[A,B,X,C]
+批量提交：A 最后出现在位置 3、B 在位置 2
+          → 同样得到 [A, B, X, C]  ✓</code></pre>
+
+<h2 id="s6">6. 内存控制：剪枝与压缩</h2>
+<p>Online 长流场景有两个内存问题，各有一个机制应对：</p>
+<table>
+  <tr><th>机制</th><th>解决的问题</th><th>做法</th></tr>
+  <tr>
+    <td><code>PruneToTrackedCapacity</code><br><span class="src">lite_hit.cc:181</span></td>
+    <td>unique key 无限增长</td>
+    <td>无“无限容量”配置时，掉出最大有限容量之外的 key 对所有查询容量必然 miss，等价 cold——直接从 Fenwick 和 <code>last_positions_</code> 删除。用单调队列 <code>position_order_</code> 找最老活跃 marker（惰性跳过失效条目）。效果：<strong>U ≤ 最大有限容量</strong>。</td>
+  </tr>
+  <tr>
+    <td><code>MaybeCompactPositions</code><br><span class="src">lite_hit.cc:201</span></td>
+    <td>位置序号只增不减，Fenwick 数组随历史访问数膨胀（大量 0 洞）</td>
+    <td>当活跃位置不足超额部分一半时（slack 阈值 4096），把所有活跃 key 按原相对顺序重编号，重建紧凑 Fenwick。摊还后空间由<strong>当前活跃状态</strong>而非历史总访问数主导。</td>
+  </tr>
+</table>
+<p>只有配置了无限容量时，才必须保留全部历史 unique key（用于区分 cold / reuse）。</p>
+
+<h2 id="s7">7. Token 命中率换算：两个不能混淆的“大小”</h2>
+<table>
+  <tr><th>量</th><th>单位</th><th>用途</th></tr>
+  <tr><td><code>block_size_tokens</code></td><td>token / block</td><td>把 prefix hit block 数换算成命中 token 数</td></tr>
+  <tr><td><code>block_charge_bytes</code></td><td>byte / block</td><td>把字节容量换算成 block 容量：<code>floor(capacity_bytes / block_charge_bytes)</code>，在 Online/Offline 适配层完成，LiteHit 核心只见 block 数</td></tr>
+</table>
+<pre><code>hit_rate = hit_count × block_size_tokens / input_token_len</code></pre>
+<ul>
+  <li>尾部不足一个 block 的 token <strong>不进 LRU，但留在分母</strong>：50 token、block=16、全命中 → 48/50 = 96%，不是 100%。</li>
+  <li>累计命中率必须先累加整数分子分母再相除，<strong>不能对每条请求的命中率取算术平均</strong>（请求长短不同）。</li>
+</ul>
+
+<h2 id="s8">8. 端到端算例</h2>
+<p>设 <code>block_size_tokens = 4</code>，<code>block_charge_bytes = 1024</code>，目标容量 2048B / 3072B / ∞ → 换算成 2 / 3 / ∞ blocks。</p>
+
+<h3>Request 1：keys = [A, B, C]，input_token_len = 13</h3>
+<p>3 个 block 全 cold → <code>hit_count = [0, 0, 0]</code>。请求后 LRU：<code>[C, B, A]</code>。</p>
+
+<h3>Request 2：keys = [B, A, C]，input_token_len = 12（请求前 LRU = [C, B, A]）</h3>
+<table>
+  <tr><th>位置</th><th>Block</th><th>快照深度</th><th>自身最小容量</th><th>Prefix 最小容量</th></tr>
+  <tr><td>1</td><td>B</td><td>2</td><td>2</td><td>2</td></tr>
+  <tr><td>2</td><td>A</td><td>3</td><td>3</td><td>3</td></tr>
+  <tr><td>3</td><td>C</td><td>1</td><td>1</td><td><strong>3</strong>（被前面拖高）</td></tr>
+</table>
+<table>
+  <tr><th>容量</th><th>hit_count</th><th>hit_tokens</th><th>本条命中率</th></tr>
+  <tr><td>2 blocks</td><td>1</td><td>4</td><td>4 / 12 = 33.33%</td></tr>
+  <tr><td>3 blocks</td><td>3</td><td>12</td><td>100%</td></tr>
+  <tr><td>∞</td><td>3</td><td>12</td><td>100%</td></tr>
+</table>
+<p>容量 2 在第二个 block 处 prefix miss，但第三个 C 仍然更新 LRU。请求后 LRU：<code>[C, A, B]</code>。</p>
+
+<h3>Request 3：keys = [C]，input_token_len = 5</h3>
+<p>C 在 LRU 第 1 位，所有容量命中：<code>hit_tokens = 4</code>，命中率 4/5 = 80%。</p>
+
+<h3>累计结果（总 input token = 13 + 12 + 5 = 30）</h3>
+<table>
+  <tr><th>容量</th><th>累计 hit_count</th><th>累计 hit_tokens</th><th>累计命中率</th></tr>
+  <tr><td>2 blocks</td><td>0+1+1 = 2</td><td>8</td><td>8 / 30 = 26.67%</td></tr>
+  <tr><td>3 blocks / ∞</td><td>0+3+1 = 4</td><td>16</td><td>16 / 30 = 53.33%</td></tr>
+</table>
+
+<h2 id="s9">9. 复杂度与整体流程</h2>
+<p>设 N = 总 block 访问数，K = 容量数，U = 活跃 unique block 数（有限容量时 ≤ 最大容量），Q = 请求数：</p>
+<ul>
+  <li>每次 block 访问：Fenwick 查询/更新 <code>O(log U)</code> + 容量二分 <code>O(log K)</code>；</li>
+  <li>每条请求输出：<code>O(K)</code>（要输出 K 个结果，不可避免）；</li>
+  <li>持久状态：只有 Fenwick、<code>last_positions_</code>、容量映射、累计计数——<strong>不保留原始 trace、不保留逐访问 reuse distance、不维护 K 套 LRU 链</strong>。</li>
+</ul>
+
+<div class="flow">
+  <div class="step">多个容量的 LRU cache</div>
+  <div class="arrow">↓ <em>LRU 栈包含性质</em></div>
+  <div class="step">一条全局最近访问顺序（Fenwick + last_positions）</div>
+  <div class="arrow">↓ <em>reuse distance d → required_capacity = d + 1</em></div>
+  <div class="step">每次访问的最小命中容量</div>
+  <div class="arrow">↓ <em>请求内 prefix max + 容量差分</em></div>
+  <div class="step">所有目标容量的 prefix hit_count</div>
+  <div class="arrow">↓ <em>× block_size_tokens ÷ input_token_len</em></div>
+  <div class="step">每条请求 &amp; 累计 token 命中率</div>
+</div>
+
+<div class="callout green">
+  <div class="title">正确性验证</div>
+  用朴素多容量 LRU 做 oracle 对拍（<code>test/lite_hit_test.cc</code>）：逐请求 hit_count 一致、请求后 LRU 状态一致、Offline 批量与 Online 逐请求一致；覆盖容量 0、重复容量、无限容量、cold miss、请求内重复 key、不完整尾部 token。
+</div>
+
+<footer>
+  基于 <code>optimizer-liteHit</code> 分支源码整理 ·
+  <code>kv_cache_manager/optimizer/liteHit/{lite_hit.cc, lite_hit.h, dynamic_fenwick_tree.cc, README.md}</code>
+</footer>
+
+</div>
+</body>
+</html>
