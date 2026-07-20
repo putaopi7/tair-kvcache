@@ -43,3 +43,13 @@ py_test(
         "@pip_cpu//protobuf",
     ],
 )
+
+py_test(
+    name = "test_vineyard_report_event",
+    srcs = ["test_vineyard_report_event.py"],
+    tags = [
+        "manual",
+        "no-remote-exec",
+    ],
+    deps = ["@pip_cpu//requests"],
+)

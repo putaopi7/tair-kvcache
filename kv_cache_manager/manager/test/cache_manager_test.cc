@@ -24,6 +24,7 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -92,6 +93,42 @@ public:
 private:
     std::shared_ptr<DataStorageBackend> delegate_;
     MightExistFunc fn_;
+};
+
+class SnapshotFaultInjectingMetaLocalBackend : public MetaLocalBackend {
+public:
+    void FailNextAllocatedMarker() { fail_next_allocated_marker_ = true; }
+    void FailNextCommittedMarker() { fail_next_committed_marker_ = true; }
+    void FailNextSync() { fail_next_sync_ = true; }
+
+    ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override {
+        for (const auto &[field, value] : field_maps) {
+            (void)value;
+            if (fail_next_allocated_marker_ && IsSnapshotAllocatedVersionMetadataKey(field)) {
+                fail_next_allocated_marker_ = false;
+                return EC_ERROR;
+            }
+            if (fail_next_committed_marker_ && IsSnapshotVersionMetadataKey(field)) {
+                fail_next_committed_marker_ = false;
+                return EC_ERROR;
+            }
+        }
+        return MetaLocalBackend::PutMetaData(field_maps);
+    }
+
+    bool Sync(const KeyTypeVec & /*keys*/) noexcept override {
+        if (fail_next_sync_) {
+            fail_next_sync_ = false;
+            return false;
+        }
+        // MetaLocalBackend writes synchronously.
+        return true;
+    }
+
+private:
+    bool fail_next_allocated_marker_ = false;
+    bool fail_next_committed_marker_ = false;
+    bool fail_next_sync_ = false;
 };
 
 class CacheManagerTest : public TESTBASE {
@@ -3515,6 +3552,161 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReconcilesAndFencesIncrementalUp
     ASSERT_EQ(EC_OK, report_snapshot({}));
     retained_locations = wait_until_location_count(retained_key, 0);
     EXPECT_TRUE(retained_locations.empty());
+}
+
+TEST_F(CacheManagerTest, TestReportEventSnapshotFailuresKeepLastCommittedVersionVisible) {
+    const std::string instance_id = "test_report_event_snapshot_failures";
+    ASSERT_EQ((std::pair<ErrorCode, std::string>{EC_OK, default_storage_configs}),
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               {LocationSpecInfo("linear_0", 512)},
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto event_backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+    StorageConfig cfg;
+    cfg.set_global_unique_name("event_backend_snapshot_failures");
+    cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+    ASSERT_EQ(EC_OK, event_backend->Open(cfg, "test_trace"));
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_snapshot_failures"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_backend_snapshot_failures"});
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, meta_searcher);
+    ASSERT_TRUE(meta_searcher->meta_indexer_);
+    auto faulty_backend = std::make_unique<SnapshotFaultInjectingMetaLocalBackend>();
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    ASSERT_EQ(EC_OK, faulty_backend->Init(instance_id, backend_config));
+    ASSERT_EQ(EC_OK, faulty_backend->Open());
+    auto *faulty_backend_raw = faulty_backend.get();
+    ASSERT_EQ(EC_OK, meta_searcher->meta_indexer_->backend_manager_->persistent_backend_->Close());
+    meta_searcher->meta_indexer_->backend_manager_->persistent_backend_ = std::move(faulty_backend);
+    meta_searcher->meta_indexer_->backend_manager_->cache_backend_.reset();
+
+    const std::string host = "10.0.0.21:8080";
+    const std::string medium = "mem";
+    const int64_t block_key = 9250;
+    const SnapshotScopeKey scope{instance_id, host, medium};
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        auto *event = req.add_events();
+        event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        event->mutable_node_register()->add_mediums(medium);
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    }
+
+    auto report_snapshot = [&](const std::string &payload, proto::meta::ReportEventResponse &resp) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        auto *event = req.add_events();
+        event->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+        auto *snapshot = event->mutable_block_snapshot();
+        snapshot->set_medium(medium);
+        auto *block = snapshot->add_blocks();
+        block->set_block_key(std::to_string(block_key));
+        auto *spec = block->add_specs();
+        spec->set_name("linear_0");
+        spec->set_uri("event_report://physical:9600/cache/9250?payload=" + payload);
+        return cache_manager_->ReportEvent(request_context_.get(), &req, &resp);
+    };
+
+    auto get_versions = [&]() {
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask = static_cast<size_t>(0);
+        EXPECT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {block_key}, mask, location_maps));
+        EXPECT_EQ(1u, location_maps.size());
+
+        std::set<uint64_t> physically_stored_versions;
+        std::set<uint64_t> visible_versions;
+        if (location_maps.empty()) {
+            return std::pair<std::set<uint64_t>, std::set<uint64_t>>{std::move(physically_stored_versions),
+                                                                     std::move(visible_versions)};
+        }
+        for (const auto &[location_id, location] : location_maps.front()) {
+            (void)location_id;
+            if (!location || location->location_specs().empty()) {
+                continue;
+            }
+            const auto &uri_text = location->location_specs().front().uri();
+            SnapshotUriInfo info;
+            if (!ParseSnapshotUriInfo(uri_text, info)) {
+                ADD_FAILURE() << "invalid internal snapshot URI: " << uri_text;
+                continue;
+            }
+            physically_stored_versions.insert(info.version);
+            const auto exists = event_backend->MightExist({DataStorageUri(uri_text)});
+            EXPECT_EQ(1u, exists.size());
+            if (!exists.empty() && exists.front()) {
+                visible_versions.insert(info.version);
+            }
+        }
+        return std::pair<std::set<uint64_t>, std::set<uint64_t>>{std::move(physically_stored_versions),
+                                                                 std::move(visible_versions)};
+    };
+
+    proto::meta::ReportEventResponse resp;
+    ASSERT_EQ(EC_OK, report_snapshot("committed-v1", resp));
+    EXPECT_EQ(1u, event_backend->GetSnapshotVersion(scope));
+    {
+        const auto [stored, visible] = get_versions();
+        EXPECT_EQ((std::set<uint64_t>{1}), stored);
+        EXPECT_EQ((std::set<uint64_t>{1}), visible);
+    }
+
+    // Version 2 reaches metadata storage but its Sync barrier fails.  The COW
+    // location may remain physically present, but it must not become visible.
+    faulty_backend_raw->FailNextSync();
+    resp.Clear();
+    EXPECT_EQ(EC_PARTIAL_OK, report_snapshot("sync-failed-v2", resp));
+    EXPECT_EQ(proto::meta::INTERNAL_ERROR, resp.header().status().code());
+    EXPECT_EQ(1u, event_backend->GetSnapshotVersion(scope));
+    {
+        const auto [stored, visible] = get_versions();
+        EXPECT_EQ((std::set<uint64_t>{1, 2}), stored);
+        EXPECT_EQ((std::set<uint64_t>{1}), visible);
+    }
+
+    // Version 3 passes Sync but cannot persist the commit marker.  It is also
+    // fenced off, proving that the marker is the publication point.
+    faulty_backend_raw->FailNextCommittedMarker();
+    resp.Clear();
+    EXPECT_EQ(EC_PARTIAL_OK, report_snapshot("marker-failed-v3", resp));
+    EXPECT_EQ(1u, event_backend->GetSnapshotVersion(scope));
+    {
+        const auto [stored, visible] = get_versions();
+        EXPECT_EQ(1u, stored.count(1));
+        EXPECT_EQ(1u, stored.count(3));
+        EXPECT_EQ((std::set<uint64_t>{1}), visible);
+    }
+
+    resp.Clear();
+    ASSERT_EQ(EC_OK, report_snapshot("committed-v4", resp));
+    EXPECT_EQ(4u, event_backend->GetSnapshotVersion(scope));
+    EXPECT_EQ((std::set<uint64_t>{4}), get_versions().second);
+
+    // A failed high-water marker prevents block writes.  The next in-process
+    // retry still skips that failed allocation.
+    faulty_backend_raw->FailNextAllocatedMarker();
+    resp.Clear();
+    EXPECT_EQ(EC_PARTIAL_OK, report_snapshot("allocation-failed-v5", resp));
+    EXPECT_EQ(4u, event_backend->GetSnapshotVersion(scope));
+    EXPECT_EQ((std::set<uint64_t>{4}), get_versions().second);
+
+    resp.Clear();
+    ASSERT_EQ(EC_OK, report_snapshot("committed-v6", resp));
+    EXPECT_EQ(6u, event_backend->GetSnapshotVersion(scope));
+    EXPECT_EQ((std::set<uint64_t>{6}), get_versions().second);
 }
 
 // =============================================================

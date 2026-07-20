@@ -326,6 +326,69 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
     EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+
+    // A location id has stable storage ownership.  Rejecting a type mutation
+    // must leave both the stored location and per-type accounting unchanged.
+    replace_tasks[0][0].type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    EXPECT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_BADARGS}), per_key_ec);
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+    EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps.front().size());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, location_maps.front().at(location_id)->type());
+}
+
+TEST_F(MetaSearcherTest, TestCleanupStaleSnapshotLocationsKeepsStorageUsageExact) {
+    const MetaSearcher::KeyVector keys = {10007};
+    const SnapshotScopeKey scope{"test", "127.0.0.1:8080", "mem"};
+    const std::string location_v1 = "kvs#event_report#mem#snapshot_v=1#127.0.0.1:8080";
+    const std::string location_v2 = "kvs#event_report#mem#snapshot_v=2#127.0.0.1:8080";
+    std::string uri_v1;
+    std::string uri_v2;
+    ASSERT_TRUE(AddSnapshotVersionToUri("event_report://physical:9600/mem?size=10", scope, 1, uri_v1));
+    ASSERT_TRUE(AddSnapshotVersionToUri("event_report://physical:9600/mem?size=7", scope, 2, uri_v2));
+
+    std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> replace_tasks = {{
+        {location_v1,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", uri_v1)}},
+        {location_v2,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", uri_v2)}},
+    }};
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    EXPECT_EQ(17u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->CleanupLocationsByPredicate(
+                  request_context_.get(),
+                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                  1,
+                  [&](int64_t, const std::string &, const CacheLocation &location) {
+                      SnapshotUriInfo info;
+                      return !location.location_specs().empty() &&
+                             ParseSnapshotUriInfo(location.location_specs().front().uri(), info) &&
+                             info.scope == scope && info.version != 2;
+                  }));
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps.front().size());
+    EXPECT_EQ((std::set<std::string>{location_v2}), std::set<std::string>({location_maps.front().begin()->first}));
 }
 
 TEST_F(MetaSearcherTest, TestSnapshotCommitMarkersSurviveIndexerRecovery) {
@@ -368,6 +431,18 @@ TEST_F(MetaSearcherTest, TestSnapshotCommitMarkersSurviveIndexerRecovery) {
     EXPECT_EQ((std::pair<uint64_t, uint64_t>{4, 4}), recovered["10.0.0.1:8080/mem"]);
     EXPECT_EQ((std::pair<uint64_t, uint64_t>{7, 7}), recovered["10.0.0.1:8080/disk"]);
     EXPECT_EQ((std::pair<uint64_t, uint64_t>{9, 0}), recovered["10.0.0.2:8080/mem"]);
+
+    // Recovery is fail-closed: silently ignoring a malformed internal marker
+    // could make an aborted COW version visible after restart.
+    ASSERT_EQ(EC_OK,
+              recovered_searcher.meta_indexer_->PutMetaData(
+                  {{std::string(KVCM_SNAPSHOT_VERSION_METADATA_PREFIX) + "malformed", "not-a-version"}}));
+    MetaSearcher corrupt_recovered_searcher(create_indexer());
+    size_t visited_scopes = 0;
+    EXPECT_EQ(EC_ERROR,
+              corrupt_recovered_searcher.VisitSnapshotVersions(
+                  "snapshot_instance", [&](const SnapshotScopeKey &, uint64_t, uint64_t) { ++visited_scopes; }));
+    EXPECT_EQ(0u, visited_scopes);
 }
 
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsContinuesMergeAfterPartialBlockFailure) {
