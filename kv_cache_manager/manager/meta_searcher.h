@@ -8,6 +8,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/data_storage/snapshot_uri_utils.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/types.h"
@@ -160,6 +161,12 @@ public:
                                      DataStorageType storage_type,
                                      size_t scan_batch_size = 1000,
                                      std::function<bool()> should_abort = nullptr);
+    bool Sync(const KeyVector &keys) noexcept;
+    ErrorCode PersistSnapshotAllocatedVersion(const SnapshotScopeKey &scope, uint64_t version) noexcept;
+    ErrorCode PersistSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version) noexcept;
+    using SnapshotVersionVisitor =
+        std::function<void(const SnapshotScopeKey &scope, uint64_t allocated_version, uint64_t committed_version)>;
+    ErrorCode VisitSnapshotVersions(const std::string &instance_id, SnapshotVersionVisitor visitor) noexcept;
 
 private:
     struct StorageTypeWeights {

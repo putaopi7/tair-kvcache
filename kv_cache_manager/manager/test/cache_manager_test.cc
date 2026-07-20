@@ -3007,6 +3007,13 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         }
         return spec_uris;
     };
+    auto scoped_uri = [&](const std::string &raw_uri, const std::string &medium) {
+        std::string result;
+        EXPECT_TRUE(AddEventReportScopeToUri(raw_uri, SnapshotScopeKey{instance_id, host, medium}, result));
+        return result;
+    };
+    const std::string mem_uri = scoped_uri("event_report://10.0.0.9:8080/mem", "mem");
+    const std::string disk_uri = scoped_uri("event_report://10.0.0.9:8080/disk", "disk");
 
     // Case 1: one BlockAdd can create one CacheLocation with multiple specs.
     const int64_t multi_spec_key = 9001;
@@ -3024,8 +3031,8 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         EXPECT_EQ(2u, loc_it->second->spec_size());
         auto spec_uris = get_spec_uris(loc_it->second);
         ASSERT_EQ(2u, spec_uris.size());
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_0"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_1"]);
     }
 
     // Case 2: later reports append new specs and overwrite same-name specs.
@@ -3041,9 +3048,9 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         EXPECT_EQ(3u, loc_it->second->spec_size());
         auto spec_uris = get_spec_uris(loc_it->second);
         ASSERT_EQ(3u, spec_uris.size());
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["full_3"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_0"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_1"]);
+        EXPECT_EQ(mem_uri, spec_uris["full_3"]);
     }
 
     // Case 3: multiple BlockAdd events for the same key in one request are merged before writing meta.
@@ -3063,8 +3070,8 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         EXPECT_EQ(2u, loc_it->second->spec_size());
         auto spec_uris = get_spec_uris(loc_it->second);
         ASSERT_EQ(2u, spec_uris.size());
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_0"]);
+        EXPECT_EQ(mem_uri, spec_uris["linear_1"]);
     }
 
     // Case 4: same key with different medium uses different location_id and does not merge into one CacheLocation.
@@ -3088,8 +3095,8 @@ TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
         auto disk_specs = get_spec_uris(disk_it->second);
         ASSERT_EQ(1u, mem_specs.size());
         ASSERT_EQ(1u, disk_specs.size());
-        EXPECT_EQ("event_report://10.0.0.9:8080/mem", mem_specs["linear_0"]);
-        EXPECT_EQ("event_report://10.0.0.9:8080/disk", disk_specs["linear_1"]);
+        EXPECT_EQ(mem_uri, mem_specs["linear_0"]);
+        EXPECT_EQ(disk_uri, disk_specs["linear_1"]);
     }
 }
 
@@ -3427,7 +3434,7 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReconcilesAndFencesIncrementalUp
     auto omitted_locations = wait_until_location_count(omitted_key, 0);
     EXPECT_TRUE(omitted_locations.empty());
 
-    const std::string location_id = event_backend->BuildLocationId(medium, host);
+    std::string location_id = event_backend->BuildSnapshotLocationId(medium, host, 1);
     auto retained_locations = get_location_map(retained_key);
     ASSERT_EQ(1u, retained_locations.size());
     ASSERT_TRUE(retained_locations.at(location_id));
@@ -3440,12 +3447,19 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReconcilesAndFencesIncrementalUp
         EXPECT_EQ(medium, info.scope.medium);
         EXPECT_EQ(1u, info.version);
     }
+    auto [host_state_ec, host_matches] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, {retained_key}, {medium});
+    ASSERT_EQ(EC_OK, host_state_ec);
+    ASSERT_EQ(1u, host_matches.size());
+    EXPECT_EQ(host, host_matches.front().host_ip_port);
+    EXPECT_EQ(1, host_matches.front().prefix_match_blocks);
 
     // A later full snapshot replaces all specs for a reported block.
     ASSERT_EQ(
         EC_OK,
         report_snapshot({{retained_key, {LocationSpec("linear_0", "event_report://physical-a:9600/cache/9201")}}}));
-    retained_locations = get_location_map(retained_key);
+    retained_locations = wait_until_location_count(retained_key, 1);
+    location_id = event_backend->BuildSnapshotLocationId(medium, host, 2);
     ASSERT_EQ(1u, retained_locations.size());
     ASSERT_EQ(1u, retained_locations.at(location_id)->location_specs().size());
     EXPECT_EQ("linear_0", retained_locations.at(location_id)->location_specs().front().name());
@@ -3477,6 +3491,22 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReconcilesAndFencesIncrementalUp
         auto *spec = add->mutable_block_add()->add_specs();
         spec->set_name("linear_0");
         spec->set_uri("event_report://physical-c:9600/cache/9203");
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_BADARGS, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::INVALID_ARGUMENT, resp.header().status().code());
+    }
+
+    // HOST_DOWN is a terminal lifecycle event and cannot race a block mutation
+    // from the same request.
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT);
+        req.add_events()->set_event_type(proto::meta::EVENT_HOST_DOWN);
+        auto *snapshot = req.add_events();
+        snapshot->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+        snapshot->mutable_block_snapshot()->set_medium(medium);
         proto::meta::ReportEventResponse resp;
         EXPECT_EQ(EC_BADARGS, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
         EXPECT_EQ(proto::meta::INVALID_ARGUMENT, resp.header().status().code());

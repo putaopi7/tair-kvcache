@@ -480,14 +480,39 @@ TEST_F(EventReportBackendTest, SnapshotVersionLifecycleIsFencedPerScope) {
     EXPECT_EQ(9u, backend.AllocateSnapshotVersion(recovered_scope));
     EXPECT_TRUE(backend.CommitSnapshotVersion(recovered_scope, 9));
 
+    const SnapshotScopeKey failed_scope{"instance_b", "10.0.0.62:8080", "hbm"};
+    backend.ObserveAllocatedSnapshotVersion(failed_scope, 11);
+    EXPECT_EQ(0u, backend.GetSnapshotVersion(failed_scope));
+    EXPECT_EQ(12u, backend.AllocateSnapshotVersion(failed_scope));
+    backend.AbortSnapshotVersion(failed_scope, 12);
+
     std::string medium;
     std::string host;
     EXPECT_TRUE(backend.ParseLocationId(backend.BuildLocationId("hbm", "10.0.0.61:8080"), medium, host));
     EXPECT_EQ("hbm", medium);
     EXPECT_EQ("10.0.0.61:8080", host);
+    EXPECT_TRUE(backend.ParseLocationId(backend.BuildSnapshotLocationId("hbm", "10.0.0.61:8080", 8), medium, host));
+    EXPECT_EQ("hbm", medium);
+    EXPECT_EQ("10.0.0.61:8080", host);
+    EXPECT_FALSE(backend.ParseLocationId("kvs#event_report#hbm#snapshot_v=bad#10.0.0.61:8080", medium, host));
     EXPECT_FALSE(backend.ParseLocationId("kvs#event_report#hbm", medium, host));
 
     ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(EventReportBackendTest, SnapshotVersionMetadataKeyRoundTripsUnambiguousScope) {
+    const SnapshotScopeKey scope{"instance_a", "[2001:db8::1]:8080", "gpu#hbm"};
+    const std::string key = SnapshotVersionMetadataKey(scope);
+    EXPECT_TRUE(IsSnapshotVersionMetadataKey(key));
+
+    SnapshotScopeKey parsed;
+    ASSERT_TRUE(ParseSnapshotVersionMetadataKey(scope.instance_id, key, parsed));
+    EXPECT_TRUE(scope == parsed);
+    const std::string allocated_key = SnapshotAllocatedVersionMetadataKey(scope);
+    ASSERT_TRUE(ParseSnapshotAllocatedVersionMetadataKey(scope.instance_id, allocated_key, parsed));
+    EXPECT_TRUE(scope == parsed);
+    EXPECT_FALSE(ParseSnapshotVersionMetadataKey(scope.instance_id, "__event_snapshot_version__#bad", parsed));
+    EXPECT_FALSE(ParseSnapshotVersionMetadataKey("", key, parsed));
 }
 
 TEST_F(EventReportBackendTest, MightExistRequiresCommittedVersionAndAuthoritativeReporterHost) {
@@ -496,6 +521,20 @@ TEST_F(EventReportBackendTest, MightExistRequiresCommittedVersionAndAuthoritativ
 
     const SnapshotScopeKey scope{"instance_a", "10.0.0.70:8080", "mem"};
     ASSERT_EQ(EC_OK, backend.RegisterNode(scope.instance_id, scope.host_ip_port, {scope.medium}));
+
+    std::string scoped_incremental_uri;
+    ASSERT_TRUE(AddEventReportScopeToUri(
+        "event_report://physical-storage.example:9600/cache/1", scope, scoped_incremental_uri));
+    EXPECT_EQ(std::vector<bool>({true}), backend.MightExist({DataStorageUri(scoped_incremental_uri)}));
+    const SnapshotScopeKey unregistered_scope{"instance_b", scope.host_ip_port, scope.medium};
+    std::string unregistered_incremental_uri;
+    ASSERT_TRUE(AddEventReportScopeToUri(
+        "event_report://physical-storage.example:9600/cache/1", unregistered_scope, unregistered_incremental_uri));
+    EXPECT_EQ(std::vector<bool>({false}), backend.MightExist({DataStorageUri(unregistered_incremental_uri)}));
+    EXPECT_EQ(std::vector<bool>({false}),
+              backend.MightExist({DataStorageUri(
+                  "event_report://physical-storage.example:9600/cache/1?kvcm_instance_id=instance_a")}));
+
     const uint64_t version1 = backend.AllocateSnapshotVersion(scope);
     ASSERT_EQ(1u, version1);
 

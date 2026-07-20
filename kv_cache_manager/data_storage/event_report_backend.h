@@ -64,12 +64,15 @@ public:
     uint64_t GetNodeGeneration(const std::string &instance_id, const std::string &host_ip_port) const;
 
     std::string BuildLocationId(const std::string &medium, const std::string &host_ip_port) const;
+    std::string
+    BuildSnapshotLocationId(const std::string &medium, const std::string &host_ip_port, uint64_t version) const;
     bool ParseLocationId(const std::string &location_id, std::string &out_medium, std::string &out_host_ip_port) const;
     std::string HostSuffix(const std::string &host_ip_port) const;
     // Returns 0 while another snapshot for the same scope is in flight.
     uint64_t AllocateSnapshotVersion(const SnapshotScopeKey &scope);
     bool CommitSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
     void AbortSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
+    void ObserveAllocatedSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
     void ObserveSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
     uint64_t GetSnapshotVersion(const SnapshotScopeKey &scope) const;
     DataStorageType GetStorageType() const;

@@ -265,10 +265,10 @@ private:
                               const std::string &host_ip_port,
                               uint64_t cleanup_generation,
                               DataStorageType storage_type);
-    void CleanupStaleSnapshotLocations(const SnapshotScopeKey &scope,
-                                       uint64_t snapshot_version,
-                                       DataStorageType storage_type,
-                                       const std::shared_ptr<EventReportBackend> &event_backend);
+    ErrorCode CleanupStaleSnapshotLocations(const SnapshotScopeKey &scope,
+                                            uint64_t snapshot_version,
+                                            DataStorageType storage_type,
+                                            const std::shared_ptr<EventReportBackend> &event_backend);
     void ScheduleStaleSnapshotCleanup(const SnapshotScopeKey &scope,
                                       uint64_t snapshot_version,
                                       DataStorageType storage_type,
@@ -344,13 +344,14 @@ private:
     // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
     std::thread recover_retry_thread_;
     std::atomic<bool> recover_retry_stop_{false};
-    // 需要清理 - event snapshot 版本表由 event backend 内存维护，恢复扫描只需每个 instance 做一次
+    // 需要清理 - event snapshot 版本表由 event backend 内存维护，持久化版本恢复每个 instance 只做一次
     std::mutex snapshot_version_recovery_mutex_;
     std::set<std::string> snapshot_version_recovered_instances_;
     struct SnapshotCleanupState {
         uint64_t latest_version = 0;
         DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
         std::shared_ptr<EventReportBackend> event_backend;
+        uint32_t retry_count = 0;
     };
     // 需要清理 - 同一 snapshot scope 最多保留一个后台扫描任务，连续版本合并到最新值
     std::mutex snapshot_cleanup_mutex_;

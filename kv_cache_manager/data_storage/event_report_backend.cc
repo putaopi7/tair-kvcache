@@ -406,6 +406,16 @@ std::vector<bool> EventReportBackend::MightExist(const std::vector<DataStorageUr
     for (const auto &uri : storage_uris) {
         SnapshotUriInfo snapshot_info;
         const bool has_snapshot_version = ParseSnapshotUriInfo(uri, snapshot_info);
+        SnapshotScopeKey reporter_scope;
+        const bool has_reporter_scope = ParseEventReportScopeFromUri(uri, reporter_scope);
+        if (HasEventReportInternalUriMetadata(uri) && !has_reporter_scope) {
+            result.push_back(false);
+            continue;
+        }
+        if (!uri.GetParam(KVCM_SNAPSHOT_VERSION_PARAM).empty() && !has_snapshot_version) {
+            result.push_back(false);
+            continue;
+        }
         if (has_snapshot_version) {
             auto version_it = snapshot_versions_.find(snapshot_info.scope);
             if (version_it == snapshot_versions_.end() || version_it->second.committed == 0 ||
@@ -415,12 +425,11 @@ std::vector<bool> EventReportBackend::MightExist(const std::vector<DataStorageUr
             }
         }
 
-        if (uri.Valid() && !uri.GetHostName().empty()) {
-            const std::string host_ip_port =
-                has_snapshot_version ? snapshot_info.scope.host_ip_port : HostIpPortFromUri(uri);
+        if (has_reporter_scope || (uri.Valid() && !uri.GetHostName().empty())) {
+            const std::string host_ip_port = has_reporter_scope ? reporter_scope.host_ip_port : HostIpPortFromUri(uri);
             bool available = false;
-            if (has_snapshot_version) {
-                auto inst_it = instance_nodes_.find(snapshot_info.scope.instance_id);
+            if (has_reporter_scope) {
+                auto inst_it = instance_nodes_.find(reporter_scope.instance_id);
                 if (inst_it != instance_nodes_.end()) {
                     auto host_it = inst_it->second.find(host_ip_port);
                     available = host_it != inst_it->second.end() && host_it->second &&
@@ -465,21 +474,19 @@ std::string EventReportBackend::BuildLocationId(const std::string &medium, const
     return result;
 }
 
+std::string EventReportBackend::BuildSnapshotLocationId(const std::string &medium,
+                                                        const std::string &host_ip_port,
+                                                        uint64_t version) const {
+    if (version == 0) {
+        return BuildLocationId(medium, host_ip_port);
+    }
+    return BuildEventReportLocationId(medium, host_ip_port, version);
+}
+
 bool EventReportBackend::ParseLocationId(const std::string &location_id,
                                          std::string &out_medium,
                                          std::string &out_host_ip_port) const {
-    static constexpr const char *kPrefix = "kvs#event_report#";
-    static constexpr size_t kPrefixSize = 17;
-    if (location_id.size() <= kPrefixSize || location_id.compare(0, kPrefixSize, kPrefix, kPrefixSize) != 0) {
-        return false;
-    }
-    const size_t host_sep = location_id.find('#', kPrefixSize);
-    if (host_sep == std::string::npos || host_sep == kPrefixSize || host_sep + 1 >= location_id.size()) {
-        return false;
-    }
-    out_medium = location_id.substr(kPrefixSize, host_sep - kPrefixSize);
-    out_host_ip_port = location_id.substr(host_sep + 1);
-    return true;
+    return ParseEventReportLocationId(location_id, out_medium, out_host_ip_port);
 }
 
 std::string EventReportBackend::HostSuffix(const std::string &host_ip_port) const { return "#" + host_ip_port; }
@@ -523,6 +530,15 @@ void EventReportBackend::AbortSnapshotVersion(const SnapshotScopeKey &scope, uin
     if (it != snapshot_versions_.end() && it->second.in_flight == version) {
         it->second.in_flight = 0;
     }
+}
+
+void EventReportBackend::ObserveAllocatedSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version) {
+    if (version == 0 || scope.instance_id.empty() || scope.host_ip_port.empty() || scope.medium.empty()) {
+        return;
+    }
+    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    auto &state = snapshot_versions_[scope];
+    state.allocated = std::max(state.allocated, version);
 }
 
 void EventReportBackend::ObserveSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version) {

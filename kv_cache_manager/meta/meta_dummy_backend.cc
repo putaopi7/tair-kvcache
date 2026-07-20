@@ -461,7 +461,9 @@ ErrorCode MetaDummyBackend::SampleReclaimKeys(RequestContext *request_context,
 
 ErrorCode MetaDummyBackend::PutMetaData(const FieldMap &field_map) noexcept {
     std::lock_guard<std::mutex> guard(mutex_);
-    metadata_ = field_map;
+    for (const auto &[field, value] : field_map) {
+        metadata_[field] = value;
+    }
     return PersistToPath();
 }
 

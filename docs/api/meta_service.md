@@ -121,11 +121,16 @@ components. It cannot be paginated or mixed with block add/delete events in
 the same request; wait for its ACK before sending later deltas. An empty
 snapshot clears the scope.
 
-KVCM writes an internal snapshot version into each reported URI, filters old
-versions through `MightExist`, and deletes stale versions asynchronously in a
-coalesced background scan. A snapshot rewrites every reported block and should
-therefore be used for low-frequency reconciliation, not high-frequency status
-reporting. Callers must not set the internal `kvcm_*` URI params themselves.
+KVCM writes internal scope metadata into every event-report URI. Snapshot data
+also carries its version: KVCM writes the new version to copy-on-write location
+ids after persisting an allocated-version high-water mark, flushes the block
+writes, and then persists a scope-level commit marker before acknowledging the
+snapshot. Queries filter old versions through `MightExist`, while a coalesced
+background scan deletes them asynchronously. A snapshot rewrites every reported
+block and should therefore be used for low-frequency reconciliation, not
+high-frequency status reporting. Callers must not set the internal `kvcm_*` URI
+params themselves. `EVENT_HOST_DOWN` is terminal and must be sent as the only
+event in its request.
 
 ```bash
 curl -g -vvv -X POST http://localhost:6382/api/reportEvent \

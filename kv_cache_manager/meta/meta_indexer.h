@@ -114,6 +114,11 @@ public:
     // Returns async write path stats from async backend.
     MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
+    // Instance-level metadata used by components that need a durable commit
+    // marker in the same persistent backend as block metadata.
+    ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
+    ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
+
     // storage usage interfaces
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
     [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;

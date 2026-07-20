@@ -3,7 +3,7 @@
 ### 设计文档
 - [模块架构与关联关系](design/module_architecture.md) - 各模块职责、依赖方向、控制流与数据流，附 Mermaid 图
 - [基本概念](design/basic_concepts.md) - Storage、Instance Group、Instance、Block、CacheLocation 等核心概念
-- [ReportEvent Snapshot URI 版本方案](design/report_event_snapshot_uri_version.md) - Snapshot 全量覆盖、URI 版本、MightExist 过滤与后台清理
+- [ReportEvent 增量上报与权威快照设计](design/report_event_snapshot_uri_version.md) - 增量/快照协同、提交屏障、故障恢复、性能取舍与 Subscriber 集成
 - [高可用与选主机制](design/ha_leader_elector.md) - HA 架构、LeaderElector 状态机、CoordinationBackend、Leader 发现
 
 ### 开发文档

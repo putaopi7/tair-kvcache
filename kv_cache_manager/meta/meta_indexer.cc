@@ -802,6 +802,18 @@ MetaStorageBackend::AsyncWriteStats MetaIndexer::GetAsyncWriteStats() noexcept {
     return backend_manager_->GetAsyncWriteStats();
 }
 
+ErrorCode MetaIndexer::PutMetaData(const FieldMap &field_maps) noexcept {
+    FieldMap complete_fields = field_maps;
+    // RecoverMetaData requires key_count.  Include the two canonical fields so
+    // a component cannot accidentally create a metadata hash containing only
+    // its extension field before the periodic persistence loop has run.
+    complete_fields[METADATA_PROPERTY_KEY_COUNT] = std::to_string(key_count_);
+    complete_fields[METADATA_PROPERTY_STORAGE_USAGE_DATA] = storage_usage_data_.Serialize();
+    return backend_manager_->PutMetaData(complete_fields);
+}
+
+ErrorCode MetaIndexer::GetMetaData(FieldMap &field_maps) noexcept { return backend_manager_->GetMetaData(field_maps); }
+
 int64_t MetaIndexer::GetOldestAccessTime() const noexcept { return backend_manager_->GetOldestAccessTime(); }
 
 std::uint64_t MetaIndexer::GetStorageUsage() const noexcept { return storage_usage_data_.GetStorageUsage(); }

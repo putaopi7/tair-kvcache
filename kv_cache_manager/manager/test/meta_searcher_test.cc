@@ -291,6 +291,85 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsCreatesLocationWithMultipleS
     ASSERT_EQ(2u, loc->location_specs().size());
 }
 
+TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) {
+    const MetaSearcher::KeyVector keys = {10006};
+    const std::string location_id = "event_report#mem#127.0.0.1:8080";
+    std::vector<ErrorCode> per_key_ec;
+    std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem?size=10")}},
+    }};
+
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+    EXPECT_EQ(10u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+
+    // An at-least-once retry overwrites the same named spec and must not count
+    // the bytes twice.
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+    EXPECT_EQ(10u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+
+    merge_tasks[0][0].specs.emplace_back("full_3", "event_report://127.0.0.1:8080/mem?size=5");
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
+    EXPECT_EQ(15u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+
+    std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> replace_tasks = {{
+        {location_id,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         CacheLocationStatus::CLS_SERVING,
+         {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem?size=7")}},
+    }};
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+}
+
+TEST_F(MetaSearcherTest, TestSnapshotCommitMarkersSurviveIndexerRecovery) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "snapshot_commit_metadata";
+    std::filesystem::remove(path);
+    auto create_indexer = [&]() {
+        auto storage_config = std::make_shared<MetaStorageBackendConfig>();
+        storage_config->SetStorageType(META_DUMMY_BACKEND_TYPE_STR);
+        storage_config->SetStorageUri("file://" + path);
+        auto indexer_config = std::make_shared<MetaIndexerConfig>();
+        indexer_config->SetMetaStorageBackendConfig(storage_config);
+        indexer_config->SetMutexShardNum(32);
+        indexer_config->SetMaxKeyCount(10000);
+        auto cache_config = std::make_shared<MetaCachePolicyConfig>();
+        cache_config->SetCapacity(0);
+        indexer_config->SetMetaCachePolicyConfig(cache_config);
+        auto indexer = std::make_shared<MetaIndexer>();
+        EXPECT_EQ(EC_OK, indexer->Init("snapshot_instance", indexer_config));
+        return indexer;
+    };
+
+    const SnapshotScopeKey mem_scope{"snapshot_instance", "10.0.0.1:8080", "mem"};
+    const SnapshotScopeKey disk_scope{"snapshot_instance", "10.0.0.1:8080", "disk"};
+    const SnapshotScopeKey failed_scope{"snapshot_instance", "10.0.0.2:8080", "mem"};
+    {
+        MetaSearcher searcher(create_indexer());
+        ASSERT_EQ(EC_OK, searcher.PersistSnapshotVersion(mem_scope, 4));
+        ASSERT_EQ(EC_OK, searcher.PersistSnapshotVersion(disk_scope, 7));
+        ASSERT_EQ(EC_OK, searcher.PersistSnapshotAllocatedVersion(failed_scope, 9));
+    }
+
+    MetaSearcher recovered_searcher(create_indexer());
+    std::map<std::string, std::pair<uint64_t, uint64_t>> recovered;
+    ASSERT_EQ(
+        EC_OK,
+        recovered_searcher.VisitSnapshotVersions(
+            "snapshot_instance", [&recovered](const SnapshotScopeKey &scope, uint64_t allocated, uint64_t committed) {
+                recovered[scope.host_ip_port + "/" + scope.medium] = {allocated, committed};
+            }));
+    EXPECT_EQ((std::pair<uint64_t, uint64_t>{4, 4}), recovered["10.0.0.1:8080/mem"]);
+    EXPECT_EQ((std::pair<uint64_t, uint64_t>{7, 7}), recovered["10.0.0.1:8080/disk"]);
+    EXPECT_EQ((std::pair<uint64_t, uint64_t>{9, 0}), recovered["10.0.0.2:8080/mem"]);
+}
+
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsContinuesMergeAfterPartialBlockFailure) {
     auto faulty_backend = ReplaceWithFaultyBackend();
     ASSERT_NE(nullptr, faulty_backend);
