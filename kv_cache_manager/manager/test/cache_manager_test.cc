@@ -3511,6 +3511,24 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReconcilesAndFencesIncrementalUp
         ASSERT_TRUE(ParseSnapshotUriInfo(spec.uri(), info));
         EXPECT_EQ(2u, info.version);
     }
+    // The backend fence also covers concurrent requests. A snapshot that has
+    // allocated its version rejects deltas, and an active delta rejects snapshots.
+    const SnapshotScopeKey scope{instance_id, host, medium};
+    const int64_t fenced_key = 9204;
+    ASSERT_EQ(3u, event_backend->AllocateSnapshotVersion(scope));
+    EXPECT_EQ(EC_PARTIAL_OK,
+              report_add(fenced_key, {LocationSpec("linear_0", "event_report://physical-d:9600/cache/9204")}));
+    EXPECT_TRUE(get_location_map(fenced_key).empty());
+    event_backend->AbortSnapshotVersion(scope, 3);
+    ASSERT_EQ(EC_OK, report_add(fenced_key, {LocationSpec("linear_0", "event_report://physical-d:9600/cache/9204")}));
+    EXPECT_EQ(1u, get_location_map(fenced_key).size());
+
+    uint64_t pinned_version = 0;
+    ASSERT_TRUE(event_backend->BeginDeltaMutation(scope, pinned_version));
+    EXPECT_EQ(2u, pinned_version);
+    EXPECT_EQ(EC_PARTIAL_OK, report_snapshot({}));
+    EXPECT_EQ(2u, event_backend->GetSnapshotVersion(scope));
+    event_backend->EndDeltaMutation(scope);
 
     // A snapshot request is a mutation barrier and cannot be mixed with deltas.
     {
@@ -3552,6 +3570,8 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotReconcilesAndFencesIncrementalUp
     ASSERT_EQ(EC_OK, report_snapshot({}));
     retained_locations = wait_until_location_count(retained_key, 0);
     EXPECT_TRUE(retained_locations.empty());
+    auto fenced_locations = wait_until_location_count(fenced_key, 0);
+    EXPECT_TRUE(fenced_locations.empty());
 }
 
 TEST_F(CacheManagerTest, TestReportEventSnapshotFailuresKeepLastCommittedVersionVisible) {

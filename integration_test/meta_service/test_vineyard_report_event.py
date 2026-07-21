@@ -1197,6 +1197,20 @@ class EventReportFunctionalTest(unittest.TestCase):
                     _build_event_report_uri(host, "mem", {"kvcm_snapshot_version": "99"}),
                 ),
             }]),
+            _ev_block_snapshot("mem", [{
+                "block_key": 9503,
+                "specs": _make_single_spec(
+                    "linear_0",
+                    _build_event_report_uri(host, "mem", {"kvcm_snapshot_version": ""}),
+                ),
+            }]),
+            _ev_block_snapshot("mem", [{
+                "block_key": 9504,
+                "specs": _make_single_spec(
+                    "linear_0",
+                    _build_event_report_uri(host, "mem", {"kvcm_future_internal": "client_value"}),
+                ),
+            }]),
             _ev_block_snapshot("mem", [
                 {"block_key": 9502, "specs": _make_single_spec(
                     "linear_0", _build_event_report_uri(host, "mem"))},
@@ -1217,6 +1231,12 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         _wait_for_block_spec_names(
             self.client, self.instance_id, 9502, set(), "t19_duplicate_block_no_write"
+        )
+        _wait_for_block_spec_names(
+            self.client, self.instance_id, 9503, set(), "t19_empty_reserved_param_no_write"
+        )
+        _wait_for_block_spec_names(
+            self.client, self.instance_id, 9504, set(), "t19_future_reserved_param_no_write"
         )
 
 # ---------------------------------------------------------------------------

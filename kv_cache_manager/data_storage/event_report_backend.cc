@@ -412,7 +412,7 @@ std::vector<bool> EventReportBackend::MightExist(const std::vector<DataStorageUr
             result.push_back(false);
             continue;
         }
-        if (!uri.GetParam(KVCM_SNAPSHOT_VERSION_PARAM).empty() && !has_snapshot_version) {
+        if (uri.HasParam(KVCM_SNAPSHOT_VERSION_PARAM) && !has_snapshot_version) {
             result.push_back(false);
             continue;
         }
@@ -491,13 +491,40 @@ bool EventReportBackend::ParseLocationId(const std::string &location_id,
 
 std::string EventReportBackend::HostSuffix(const std::string &host_ip_port) const { return "#" + host_ip_port; }
 
+bool EventReportBackend::BeginDeltaMutation(const SnapshotScopeKey &scope, uint64_t &out_committed_version) {
+    if (scope.instance_id.empty() || scope.host_ip_port.empty() || scope.medium.empty()) {
+        return false;
+    }
+    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    auto &state = snapshot_versions_[scope];
+    if (state.in_flight != 0 || state.active_delta_mutations == std::numeric_limits<uint64_t>::max()) {
+        return false;
+    }
+    ++state.active_delta_mutations;
+    out_committed_version = state.committed;
+    return true;
+}
+
+void EventReportBackend::EndDeltaMutation(const SnapshotScopeKey &scope) {
+    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    auto it = snapshot_versions_.find(scope);
+    if (it == snapshot_versions_.end() || it->second.active_delta_mutations == 0) {
+        KVCM_LOG_ERROR("EventReportBackend: unmatched delta mutation lease for instance [%s] host [%s] medium [%s]",
+                       scope.instance_id.c_str(),
+                       scope.host_ip_port.c_str(),
+                       scope.medium.c_str());
+        return;
+    }
+    --it->second.active_delta_mutations;
+}
+
 uint64_t EventReportBackend::AllocateSnapshotVersion(const SnapshotScopeKey &scope) {
     if (scope.instance_id.empty() || scope.host_ip_port.empty() || scope.medium.empty()) {
         return 0;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     auto &state = snapshot_versions_[scope];
-    if (state.in_flight != 0) {
+    if (state.in_flight != 0 || state.active_delta_mutations != 0) {
         return 0;
     }
     const uint64_t latest = std::max(state.allocated, state.committed);

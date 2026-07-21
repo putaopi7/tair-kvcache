@@ -68,7 +68,11 @@ public:
     BuildSnapshotLocationId(const std::string &medium, const std::string &host_ip_port, uint64_t version) const;
     bool ParseLocationId(const std::string &location_id, std::string &out_medium, std::string &out_host_ip_port) const;
     std::string HostSuffix(const std::string &host_ip_port) const;
-    // Returns 0 while another snapshot for the same scope is in flight.
+    // A delta lease pins the committed version until every metadata mutation in
+    // that ReportEvent request has completed.
+    bool BeginDeltaMutation(const SnapshotScopeKey &scope, uint64_t &out_committed_version);
+    void EndDeltaMutation(const SnapshotScopeKey &scope);
+    // Returns 0 while another snapshot or any delta mutation is in flight.
     uint64_t AllocateSnapshotVersion(const SnapshotScopeKey &scope);
     bool CommitSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
     void AbortSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
@@ -106,9 +110,12 @@ private:
     // instance_id -> (host_ip_port -> generation)
     std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> node_generation_;
     struct SnapshotVersionState {
+        // Process-local scope state, not a distributed lock. HA correctness also
+        // relies on leader-only request fencing during ownership changes.
         uint64_t allocated = 0;
         uint64_t committed = 0;
         uint64_t in_flight = 0;
+        uint64_t active_delta_mutations = 0;
     };
     std::unordered_map<SnapshotScopeKey, SnapshotVersionState, SnapshotScopeKeyHash> snapshot_versions_;
 

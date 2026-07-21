@@ -463,11 +463,21 @@ TEST_F(EventReportBackendTest, SnapshotVersionLifecycleIsFencedPerScope) {
     EXPECT_EQ(1u, backend.AllocateSnapshotVersion(mem_scope));
     EXPECT_EQ(0u, backend.AllocateSnapshotVersion(mem_scope));
     EXPECT_EQ(1u, backend.AllocateSnapshotVersion(disk_scope));
+    uint64_t delta_version = 0;
+    EXPECT_FALSE(backend.BeginDeltaMutation(mem_scope, delta_version));
 
     EXPECT_FALSE(backend.CommitSnapshotVersion(mem_scope, 2));
     EXPECT_TRUE(backend.CommitSnapshotVersion(mem_scope, 1));
     EXPECT_EQ(1u, backend.GetSnapshotVersion(mem_scope));
     EXPECT_TRUE(backend.CommitSnapshotVersion(disk_scope, 1));
+    EXPECT_TRUE(backend.BeginDeltaMutation(mem_scope, delta_version));
+    EXPECT_EQ(1u, delta_version);
+    EXPECT_TRUE(backend.BeginDeltaMutation(mem_scope, delta_version));
+    EXPECT_EQ(1u, delta_version);
+    EXPECT_EQ(0u, backend.AllocateSnapshotVersion(mem_scope));
+    backend.EndDeltaMutation(mem_scope);
+    EXPECT_EQ(0u, backend.AllocateSnapshotVersion(mem_scope));
+    backend.EndDeltaMutation(mem_scope);
 
     EXPECT_EQ(2u, backend.AllocateSnapshotVersion(mem_scope));
     backend.AbortSnapshotVersion(mem_scope, 2);
@@ -536,6 +546,15 @@ TEST_F(EventReportBackendTest, MightExistRequiresCommittedVersionAndAuthoritativ
                   "event_report://physical-storage.example:9600/cache/1?kvcm_instance_id=instance_a")}));
 
     const uint64_t version1 = backend.AllocateSnapshotVersion(scope);
+    EXPECT_TRUE(HasEventReportInternalUriMetadata(
+        DataStorageUri("event_report://physical-storage.example:9600/cache/1?kvcm_future=")));
+    EXPECT_EQ(
+        std::vector<bool>({false}),
+        backend.MightExist({DataStorageUri("event_report://physical-storage.example:9600/cache/1?kvcm_future=")}));
+    EXPECT_EQ(std::vector<bool>({false}),
+              backend.MightExist({DataStorageUri(
+                  "event_report://physical-storage.example:9600/cache/1?kvcm_host_ip_port=10.0.0.70:8080&"
+                  "kvcm_instance_id=instance_a&kvcm_medium=mem&kvcm_snapshot_version=")}));
     ASSERT_EQ(1u, version1);
 
     std::string uri1;

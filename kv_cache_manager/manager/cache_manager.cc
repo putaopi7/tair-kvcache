@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -127,6 +128,35 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
     }
     return {EC_OK, true};
 }
+class DeltaMutationGuard {
+public:
+    explicit DeltaMutationGuard(std::shared_ptr<EventReportBackend> backend) : backend_(std::move(backend)) {}
+    DeltaMutationGuard(const DeltaMutationGuard &) = delete;
+    DeltaMutationGuard &operator=(const DeltaMutationGuard &) = delete;
+
+    ~DeltaMutationGuard() {
+        for (const auto &entry : versions_) {
+            backend_->EndDeltaMutation(entry.first);
+        }
+    }
+
+    bool Acquire(const SnapshotScopeKey &scope, uint64_t &out_committed_version) {
+        const auto it = versions_.find(scope);
+        if (it != versions_.end()) {
+            out_committed_version = it->second;
+            return true;
+        }
+        if (!backend_->BeginDeltaMutation(scope, out_committed_version)) {
+            return false;
+        }
+        versions_.emplace(scope, out_committed_version);
+        return true;
+    }
+
+private:
+    std::shared_ptr<EventReportBackend> backend_;
+    std::unordered_map<SnapshotScopeKey, uint64_t, SnapshotScopeKeyHash> versions_;
+};
 
 } // namespace
 
@@ -1607,6 +1637,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     const int events_size = request->events_size();
     std::vector<ErrorCode> per_item_ec(events_size, EC_OK);
+    DeltaMutationGuard delta_mutations(event_backend);
 
     bool has_register = false;
     bool has_heartbeat = false;
@@ -1708,7 +1739,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             entry_specs.reserve(p.specs_size());
             std::unordered_set<std::string> seen_spec_names;
             const SnapshotScopeKey scope{instance_id, host_ip_port, p.medium()};
-            const uint64_t current_snapshot_version = event_backend->GetSnapshotVersion(scope);
+            uint64_t current_snapshot_version = 0;
+            if (!delta_mutations.Acquire(scope, current_snapshot_version)) {
+                KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_ADD: snapshot is in flight for host [%s] medium [%s]",
+                              trace_id.c_str(),
+                              host_ip_port.c_str(),
+                              p.medium().c_str());
+                per_item_ec[i] = EC_ERROR;
+                break;
+            }
             std::string location_id =
                 current_snapshot_version > 0
                     ? event_backend->BuildSnapshotLocationId(p.medium(), host_ip_port, current_snapshot_version)
@@ -1792,7 +1831,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 break;
             }
             const SnapshotScopeKey scope{instance_id, host_ip_port, p.medium()};
-            const uint64_t current_snapshot_version = event_backend->GetSnapshotVersion(scope);
+            uint64_t current_snapshot_version = 0;
+            if (!delta_mutations.Acquire(scope, current_snapshot_version)) {
+                KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_DELETE: snapshot is in flight for host [%s] medium [%s]",
+                              trace_id.c_str(),
+                              host_ip_port.c_str(),
+                              p.medium().c_str());
+                per_item_ec[i] = EC_ERROR;
+                break;
+            }
             std::string location_id =
                 current_snapshot_version > 0
                     ? event_backend->BuildSnapshotLocationId(p.medium(), host_ip_port, current_snapshot_version)

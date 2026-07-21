@@ -91,6 +91,24 @@ scope = instance_id + reporter host_ip_port + medium
 - register、heartbeat 可以和 snapshot 同请求；
 - `HOST_DOWN` 必须单独请求，不能和任何其他事件并发解释；
 - Subscriber 应等待 snapshot ACK，再发送其后的增量事件。
+#### 5.2.1 跨请求并发栅栏
+
+“快照和增量分开发请求”只解决单个请求内的歧义，还必须防住两个请求同时到达。否则增量可能先读到旧的 committed version，快照随后提交新版本；服务端虽然已经 ACK 增量，但查询会立刻把旧版本过滤掉，形成静默丢更新。
+
+KVCM 因此在同一个 `(instance_id, host_ip_port, medium)` scope 上实现双向栅栏：
+
+- ADD/DELETE 开始时申请 delta lease，原子读取并固定当前 committed version；直到该请求的所有 metadata 写操作结束才释放。
+- 只要有 delta lease 活跃，snapshot 就不能分配新版本，请求返回可重试失败。
+- snapshot 一旦分配 `in_flight` version，后来的 ADD/DELETE 就不能取得 delta lease，请求同样返回可重试失败。
+- 一个请求内同一 scope 的多个增量事件复用一个 lease；不同 scope 互不阻塞。
+
+两种竞争顺序都不会被 ACK 成功后再被遮蔽：
+
+```text
+delta first    -> snapshot rejected -> delta finishes -> snapshot retry
+snapshot first -> delta rejected    -> snapshot finishes -> delta retry
+```
+
 
 这个 ACK 边界很关键。否则 Subscriber 在 snapshot 写入期间发送的新增 block，可能被 snapshot 的完整集合覆盖掉。
 
@@ -133,6 +151,8 @@ event_report://physical-storage:9600/cache/123
   &kvcm_medium=gpu
   &kvcm_snapshot_version=2
 ```
+
+所有以 `kvcm_` 开头的参数（包括空值和未来新增名称）都属于 KVCM 保留命名空间；Reporter 输入只要携带该前缀就会被拒绝，不能利用空值绕过校验。
 
 作用域参数让 backend 在 snapshot 发生前也能按 instance 精确判断 reporter 存活状态，避免同一个 host 地址出现在多个 instance 时相互串扰。这些 `kvcm_*` 参数属于 KVCM 内部协议，Reporter 上报的原始 URI 不允许预先携带它们。解析历史原型 URI 时仍可回退到 URI host，正式数据始终以 `kvcm_host_ip_port` 为准。
 
@@ -223,10 +243,14 @@ DELETE 继续按 `spec_names` 删除。因此 full-attention 和 mamba-state 可
 
 KVCM 恢复时不再扫描全实例 location 并猜测最大版本，而是读取 instance metadata 中的 high-water 和 commit markers。恢复成本与 snapshot scope 数量相关，不再与 block 总数相关；marker 损坏会阻止后续 mutation，避免从错误基线继续分配版本。未提交的新 location 与旧 location 使用不同 id，而且失败版本不会复用，因此即使进程在任意 block 写入后崩溃，旧版本也没有被原地破坏，失败残留也不会在重试时意外变成当前版本。
 
-该提交协议依赖 KVCM leader 单写。主备切换会先停止 leader-only 请求，再由新 leader 从持久化 marker 恢复版本。
+该提交协议依赖 KVCM leader 单写。正常 HA 路径会在旧 Leader 降级时关闭 leader-only 入口并等待已进入请求结束；新 Leader 则先从持久化 marker 恢复版本，再开放请求。
+
+这里的 delta/snapshot 栅栏是 active Leader **进程内**的 scope 级互斥，不是分布式锁。正确性仍要求选主层隔离租约切换期间的旧 Leader 写入；如果绕过 service guard 多进程直接调用 `CacheManager::ReportEvent`，或者部署允许旧 Leader 的在途 mutation 与新 Leader 重叠，就必须额外引入 leader epoch/fencing token 或后端 CAS，不能只依赖本栅栏。
 
 ## 11. 并发与生命周期
 
+- 同一 scope 还维护 `active_delta_mutations` 引用计数，与 `in_flight` snapshot 在同一把锁下双向互斥。
+- CacheManager 用请求级 RAII guard 管理 delta lease，确保成功、部分失败和提前返回路径都会释放；同一请求内同一 scope 只计一次。
 - 同一 scope 只有一个 `in_flight` snapshot；不同 host 或 medium 可以并行；
 - 版本状态以 `(instance, reporter host, medium)` 为扁平复合 key，避免跨实例串扰；
 - 后台清理持有 `EventReportBackend` 的 `shared_ptr`，避免任务执行时 backend 已释放；
@@ -322,6 +346,7 @@ URI version + durable marker 把即时正确性交给版本屏障，把空间回
 - 完整 snapshot 删除遗漏 block，空 snapshot 清空 scope；
 - snapshot 替换完整 specs，后续 ADD 继承版本并正确合并；
 - 重复 ADD/snapshot 不导致 storage usage 虚增；
+- 跨请求 snapshot/delta 双向互斥、同请求 lease 复用与失败无副作用；
 - snapshot 与 delta 混发、HOST_DOWN 混发、重复 block/spec、保留 URI 参数均被拒绝；
 - 清理失败不会影响查询正确性；
 - HTTP 和 gRPC payload 一致；

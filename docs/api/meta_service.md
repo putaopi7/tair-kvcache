@@ -120,6 +120,14 @@ and every block's complete spec set, including full-attention and mamba-state
 components. It cannot be paginated or mixed with block add/delete events in
 the same request; wait for its ACK before sending later deltas. An empty
 snapshot clears the scope.
+KVCM also serializes snapshot and delta mutations across concurrent requests for
+the same scope. A delta request acquires a lease that pins the current committed
+version until all of its metadata writes finish; snapshot version allocation is
+rejected while such a lease is active. Conversely, once a snapshot version is
+in flight, later add/delete events for that scope are rejected. The rejected
+item is not written and the caller should retry it after the earlier request
+finishes. Different hosts or media remain independent.
+
 
 KVCM writes internal scope metadata into every event-report URI. Snapshot data
 also carries its version: KVCM writes the new version to copy-on-write location
@@ -130,6 +138,8 @@ background scan deletes them asynchronously. A snapshot rewrites every reported
 block and should therefore be used for low-frequency reconciliation, not
 high-frequency status reporting. Callers must not set the internal `kvcm_*` URI
 params themselves. `EVENT_HOST_DOWN` is terminal and must be sent as the only
+This reservation applies to every parameter name beginning with `kvcm_`,
+including blank values and names introduced by future KVCM versions.
 event in its request.
 
 ```bash

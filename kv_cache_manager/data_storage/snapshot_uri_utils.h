@@ -10,6 +10,7 @@
 
 namespace kv_cache_manager {
 
+inline constexpr const char *KVCM_INTERNAL_URI_PARAM_PREFIX = "kvcm_";
 inline constexpr const char *KVCM_EVENT_REPORT_INSTANCE_PARAM = "kvcm_instance_id";
 inline constexpr const char *KVCM_EVENT_REPORT_HOST_PARAM = "kvcm_host_ip_port";
 inline constexpr const char *KVCM_EVENT_REPORT_MEDIUM_PARAM = "kvcm_medium";
@@ -68,9 +69,7 @@ inline std::string HostIpPortFromUri(const DataStorageUri &uri) {
 }
 
 inline bool HasEventReportInternalUriMetadata(const DataStorageUri &uri) {
-    return !uri.GetParam(KVCM_EVENT_REPORT_INSTANCE_PARAM).empty() ||
-           !uri.GetParam(KVCM_EVENT_REPORT_HOST_PARAM).empty() ||
-           !uri.GetParam(KVCM_EVENT_REPORT_MEDIUM_PARAM).empty() || !uri.GetParam(KVCM_SNAPSHOT_VERSION_PARAM).empty();
+    return uri.HasParamWithPrefix(KVCM_INTERNAL_URI_PARAM_PREFIX);
 }
 
 inline bool ParseEventReportScopeFromUri(const DataStorageUri &uri, SnapshotScopeKey &out) {
