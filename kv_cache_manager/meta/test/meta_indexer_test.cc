@@ -260,6 +260,9 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
         }
     }
 
+    const std::string snapshot_marker = "__event_snapshot_version__#scope";
+    ASSERT_EQ(EC_OK, meta_indexer_->PutMetaData({{snapshot_marker, "9"}}));
+
     // persist
     meta_indexer_->key_count_.store(3);
     const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700, 800};
@@ -268,6 +271,10 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
         meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
     }
     meta_indexer_->PersistMetaData();
+
+    FieldMap persisted_metadata;
+    ASSERT_EQ(EC_OK, meta_indexer_->GetMetaData(persisted_metadata));
+    EXPECT_EQ("9", persisted_metadata[snapshot_marker]);
 
     // verify recovery behavior
     {

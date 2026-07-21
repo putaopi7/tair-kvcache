@@ -117,6 +117,9 @@ private:
         uint64_t in_flight = 0;
         uint64_t active_delta_mutations = 0;
     };
+    // Snapshot generations are durable scope state, not node-liveness state.
+    // They intentionally survive UnregisterNode so a re-registered reporter
+    // continues from the persisted high-water mark.
     std::unordered_map<SnapshotScopeKey, SnapshotVersionState, SnapshotScopeKeyHash> snapshot_versions_;
 
     std::thread liveness_checker_thread_;

@@ -171,6 +171,8 @@ URI 上的版本表示“这条数据由哪个 snapshot 写入”，committed fi
 
 High-water field 在写任何 block 之前落盘，保证失败 snapshot 用过的版本不会在重启后复用。否则上次失败遗留的同版本 location，可能在下一次 snapshot commit 时被误激活。
 
+这些 marker 与 `key_count`、`storage_usage` 共用 instance metadata hash，但由不同流程独立更新。因此 `PutMetaData` 的接口契约必须是 field-level upsert，不能先 `DEL` 再重建整个 hash。周期性统计持久化只更新自己负责的字段，不会删除 allocated/committed marker；同步 Redis、异步 Redis 和本地测试后端保持相同语义。
+
 ## 7. Snapshot 写入流程
 
 ```mermaid
@@ -198,13 +200,16 @@ sequenceDiagram
 
 1. 先完整校验请求，避免校验中途已经修改数据；
 2. 为 scope 分配单调递增版本，并先持久化 allocated high-water；
-3. 按 block 写入新的 versioned location 及其完整 specs，不覆盖当前 committed location；
-4. 对涉及的 block keys 执行 `Sync`，保证异步 Redis 队列已经持久化；
-5. 同步写入 durable commit marker；
-6. 发布内存 committed version，查询立即切换到新版本；
-7. 返回 ACK，并异步回收旧版本 metadata。
+3. 先在请求内存中为所有 block 生成 versioned URI；全部成功后才整体加入 metadata 写批次，避免准备阶段部分失败仍遗留待写任务；
+4. 按 block 写入新的 versioned location 及其完整 specs，不覆盖当前 committed location；
+5. 对涉及的 block keys 执行 `Sync`，保证异步 Redis 队列已经持久化；
+6. 同步写入 durable commit marker；
+7. 发布内存 committed version，查询立即切换到新版本；
+8. 返回 ACK，并异步回收旧版本 metadata。
 
 空 snapshot 没有 block 数据需要 Sync，但仍会提交一个新版本。新版本发布后，整个旧 scope 立即不可见，后台再完成物理删除。
+
+`BatchReplaceLocationSpecs` 内部的 create/replace 两阶段不是跨 key 事务，允许崩溃留下未提交版本的物理残留。这里的原子性来自外层 generation commit marker：写批次可幂等重试，只有完整写入并 `Sync` 后才发布 committed version，所以残留不会变成可见数据。
 
 ## 8. 查询为什么不会读到半份数据
 
@@ -241,7 +246,7 @@ DELETE 继续按 `spec_names` 删除。因此 full-attention 和 mamba-state 可
 | marker 成功后、内存发布前崩溃 | 已更新 | 重启后恢复新版本 | 无需回滚 |
 | 内存发布后清理失败 | 已更新 | 新版本可见、旧版本不可见 | 指数退避重试，未来 snapshot 仍会再清理 |
 
-KVCM 恢复时不再扫描全实例 location 并猜测最大版本，而是读取 instance metadata 中的 high-water 和 commit markers。恢复成本与 snapshot scope 数量相关，不再与 block 总数相关；marker 损坏会阻止后续 mutation，避免从错误基线继续分配版本。未提交的新 location 与旧 location 使用不同 id，而且失败版本不会复用，因此即使进程在任意 block 写入后崩溃，旧版本也没有被原地破坏，失败残留也不会在重试时意外变成当前版本。
+KVCM 恢复时不再扫描全实例 location 并猜测最大版本，而是读取 instance metadata 中的 high-water 和 commit markers。恢复成本与 snapshot scope 数量相关，不再与 block 总数相关；不同 instance 可并行恢复，同一 instance 的并发请求只执行一次 I/O。任一 marker 畸形都会 fail closed，而不是跳过后从不可信的较小版本继续分配。未提交的新 location 与旧 location 使用不同 id，而且失败版本不会复用，因此即使进程在任意 block 写入后崩溃，旧版本也没有被原地破坏，失败残留也不会在重试时意外变成当前版本。
 
 该提交协议依赖 KVCM leader 单写。正常 HA 路径会在旧 Leader 降级时关闭 leader-only 入口并等待已进入请求结束；新 Leader 则先从持久化 marker 恢复版本，再开放请求。
 
@@ -254,6 +259,8 @@ KVCM 恢复时不再扫描全实例 location 并猜测最大版本，而是读�
 - 同一 scope 只有一个 `in_flight` snapshot；不同 host 或 medium 可以并行；
 - 版本状态以 `(instance, reporter host, medium)` 为扁平复合 key，避免跨实例串扰；
 - 后台清理持有 `EventReportBackend` 的 `shared_ptr`，避免任务执行时 backend 已释放；
+- node unregister/心跳超时只删除存活信息，不删除 snapshot generation；后者是持久化 scope 状态，重注册后必须继续使用同一 high-water；
+- 版本恢复锁只协调同一个 instance；慢 metadata I/O 不阻塞其他 instance 的 ReportEvent；
 - 同一 scope 连续提交多个版本时，只保留最新清理目标；
 - 清理失败最多退避重试三次，之后保持查询侧隔离，等待下一次 snapshot 再触发回收；
 - CacheManager 析构前先停止并 join 调度线程，避免后台 lambda 访问已经析构的成员；
@@ -345,7 +352,9 @@ URI version + durable marker 把即时正确性交给版本屏障，把空间回
 - high-water/commit marker key 无歧义并可跨 MetaIndexer 重启恢复，失败版本不复用；
 - 完整 snapshot 删除遗漏 block，空 snapshot 清空 scope；
 - snapshot 替换完整 specs，后续 ADD 继承版本并正确合并；
+- MetaIndexer 周期统计写入后 snapshot marker 仍保留，Redis metadata 更新只发 `HSET` 而不发 `DEL`；
 - 重复 ADD/snapshot 不导致 storage usage 虚增；
+- snapshot URI 准备要么全部进入写批次、要么全部不进入，不能产生半批待写任务；
 - 跨请求 snapshot/delta 双向互斥、同请求 lease 复用与失败无副作用；
 - snapshot 与 delta 混发、HOST_DOWN 混发、重复 block/spec、保留 URI 参数均被拒绝；
 - 清理失败不会影响查询正确性；

@@ -1,4 +1,5 @@
 #include <atomic>
+#include <mutex>
 #include <thread>
 
 #include "kv_cache_manager/common/redis_client.h"
@@ -48,7 +49,11 @@ protected:
             auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
             ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
             ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-            ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
+            ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([this](const std::vector<CmdArgs> &cmds) {
+                {
+                    std::lock_guard<std::mutex> lock(executed_commands_mutex_);
+                    executed_commands_.insert(executed_commands_.end(), cmds.begin(), cmds.end());
+                }
                 // Inject minimal delay to ensure batch_flush_time_us > 0 in stats
                 std::this_thread::sleep_for(std::chrono::microseconds(10));
                 std::vector<ReplyUPtr> replies;
@@ -75,6 +80,8 @@ protected:
 
     std::unique_ptr<MockMetaAsyncRedisBackend> backend_;
     std::shared_ptr<MetaStorageBackendConfig> config_;
+    std::mutex executed_commands_mutex_;
+    std::vector<CmdArgs> executed_commands_;
 };
 
 // ==================== Init Tests ====================
@@ -503,12 +510,27 @@ TEST_F(MetaAsyncRedisBackendTest, TestBackpressureEnqueue) {
 
 TEST_F(MetaAsyncRedisBackendTest, TestPutMetaData) {
     ASSERT_EQ(EC_OK, InitAndOpen());
+    {
+        std::lock_guard<std::mutex> lock(executed_commands_mutex_);
+        executed_commands_.clear();
+    }
 
     FieldMap meta = {{"version", "1"}, {"created_at", "2024-01-01"}};
     ASSERT_EQ(EC_OK, backend_->PutMetaData(meta));
 
-    FieldMap out_meta;
-    backend_->GetMetaData(out_meta);
+    bool saw_hset = false;
+    bool saw_del = false;
+    {
+        std::lock_guard<std::mutex> lock(executed_commands_mutex_);
+        for (const auto &cmd : executed_commands_) {
+            if (!cmd.empty()) {
+                saw_hset = saw_hset || cmd[0] == "HSET";
+                saw_del = saw_del || cmd[0] == "DEL";
+            }
+        }
+    }
+    EXPECT_TRUE(saw_hset);
+    EXPECT_FALSE(saw_del);
 }
 
 // ==================== Metrics Tests ====================

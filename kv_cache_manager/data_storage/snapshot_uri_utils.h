@@ -25,9 +25,11 @@ struct SnapshotScopeKey {
     std::string host_ip_port;
     std::string medium;
 
-    bool operator==(const SnapshotScopeKey &other) const {
+    bool operator==(const SnapshotScopeKey &other) const noexcept {
         return instance_id == other.instance_id && host_ip_port == other.host_ip_port && medium == other.medium;
     }
+
+    bool operator!=(const SnapshotScopeKey &other) const noexcept { return !(*this == other); }
 };
 
 struct SnapshotScopeKeyHash {

@@ -235,7 +235,9 @@ public:
     // =====================================================================
 
     // 写入/更新 MetaIndexer 元数据。
-    // @param field_maps  要写入的元数据 field→value
+    // 语义为按 field 合并（upsert），不得删除 field_maps 中未出现的已有字段。调用方会独立持久化
+    // 统计信息、快照已分配版本和快照已提交版本，全量替换会破坏崩溃恢复的高水位。
+    // @param field_maps 要写入的元数据 field→value
     // @return EC_OK 成功；EC_ERROR 写入失败
     virtual ErrorCode PutMetaData(const FieldMap &field_maps) noexcept = 0;
 

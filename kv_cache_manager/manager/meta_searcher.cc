@@ -77,10 +77,12 @@ std::vector<LocationSpec> MergeLocationSpecsByName(const std::vector<LocationSpe
     }
     std::map<std::string, LocationSpec> merged_specs;
     for (const auto &spec : old_specs) {
+        // A versioned location belongs to exactly one snapshot generation. Carrying
+        // legacy or foreign-generation specs forward could make stale data visible.
         if (has_snapshot_version) {
             SnapshotUriInfo old_snapshot_info;
             if (!ParseSnapshotUriInfo(spec.uri(), old_snapshot_info) ||
-                !(old_snapshot_info.scope == new_snapshot_info.scope) ||
+                old_snapshot_info.scope != new_snapshot_info.scope ||
                 old_snapshot_info.version != new_snapshot_info.version) {
                 continue;
             }

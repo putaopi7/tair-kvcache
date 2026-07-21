@@ -198,6 +198,13 @@ public:
         ASSERT_EQ("v1", output["k1"]);
         ASSERT_EQ("v2", output["k2"]);
 
+        ASSERT_EQ(EC_OK, mgr.PutMetaData({{"k2", "v2-updated"}, {"k3", "v3"}}));
+        output.clear();
+        ASSERT_EQ(EC_OK, mgr.GetMetaData(output));
+        EXPECT_EQ("v1", output["k1"]);
+        EXPECT_EQ("v2-updated", output["k2"]);
+        EXPECT_EQ("v3", output["k3"]);
+
         ASSERT_EQ(EC_OK, mgr.Close());
     }
 

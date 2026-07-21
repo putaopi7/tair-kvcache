@@ -135,6 +135,33 @@ TEST_F(MetaRedisBackendTest, TestOpenAndClose) {
     }
 }
 
+TEST_F(MetaRedisBackendTest, TestPutMetaDataMergesFields) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, TryExecPipeline(_)).WillOnce(Invoke([](const std::vector<CmdArgs> &cmds) {
+            EXPECT_EQ(1u, cmds.size());
+            if (!cmds.empty()) {
+                EXPECT_GE(cmds[0].size(), 4u);
+                EXPECT_EQ("HSET", cmds[0][0]);
+                EXPECT_EQ("kvcache:instance_instance_0:metadata", cmds[0][1]);
+            }
+            std::vector<ReplyUPtr> replies;
+            replies.emplace_back(MakeFakeReplyInteger(1));
+            return replies;
+        }));
+        return mock_redis_client;
+    }));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->PutMetaData({{"snapshot_version", "7"}}));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
 TEST_F(MetaRedisBackendTest, TestSimple) {
     EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
         StandardUri empty_storage_uri;

@@ -1927,9 +1927,10 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             const std::string location_id =
                 event_backend->BuildSnapshotLocationId(p.medium(), host_ip_port, snapshot_version);
             KeyVector snapshot_block_keys;
+            std::vector<std::pair<KeyType, SnapshotReplaceEntry>> prepared_snapshot_entries;
             snapshot_block_keys.reserve(validated_blocks.size());
+            prepared_snapshot_entries.reserve(validated_blocks.size());
             for (auto &block : validated_blocks) {
-                snapshot_block_keys.push_back(block.block_key);
                 for (auto &spec : block.specs) {
                     std::string versioned_uri;
                     if (!AddSnapshotVersionToUri(spec.uri(), scope, snapshot_version, versioned_uri)) {
@@ -1941,12 +1942,16 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 if (per_item_ec[i] != EC_OK) {
                     break;
                 }
-                snapshot_to_replace[block.block_key].push_back(
-                    SnapshotReplaceEntry{location_id, std::move(block.specs), i});
+                snapshot_block_keys.push_back(block.block_key);
+                prepared_snapshot_entries.emplace_back(block.block_key,
+                                                       SnapshotReplaceEntry{location_id, std::move(block.specs), i});
             }
             if (per_item_ec[i] != EC_OK) {
                 event_backend->AbortSnapshotVersion(scope, snapshot_version);
                 break;
+            }
+            for (auto &[block_key, entry] : prepared_snapshot_entries) {
+                snapshot_to_replace[block_key].push_back(std::move(entry));
             }
             snapshot_commit_tasks.push_back(
                 SnapshotCommitTask{scope, snapshot_version, i, std::move(snapshot_block_keys)});
@@ -2456,24 +2461,35 @@ ErrorCode CacheManager::RecoverEventSnapshotVersions(RequestContext *request_con
     if (!meta_searcher) {
         return EC_BADARGS;
     }
-    std::lock_guard<std::mutex> lock(snapshot_version_recovery_mutex_);
+    std::unique_lock<std::mutex> lock(snapshot_version_recovery_mutex_);
+    snapshot_version_recovery_cv_.wait(lock, [this, &instance_id] {
+        return snapshot_version_recovered_instances_.count(instance_id) > 0 ||
+               snapshot_version_recovering_instances_.count(instance_id) == 0;
+    });
     if (snapshot_version_recovered_instances_.count(instance_id) > 0) {
         return EC_OK;
     }
+    snapshot_version_recovering_instances_.insert(instance_id);
+    lock.unlock();
+
     auto event_backend = LookupEventReportBackend(registry_manager_, instance_id);
-    if (!event_backend) {
-        return EC_OK;
+    ErrorCode ec = EC_OK;
+    if (event_backend) {
+        (void)request_context;
+        ec = meta_searcher->VisitSnapshotVersions(
+            instance_id, [event_backend](const SnapshotScopeKey &scope, uint64_t allocated, uint64_t committed) {
+                event_backend->ObserveAllocatedSnapshotVersion(scope, allocated);
+                event_backend->ObserveSnapshotVersion(scope, committed);
+            });
     }
 
-    (void)request_context;
-    const auto ec = meta_searcher->VisitSnapshotVersions(
-        instance_id, [event_backend](const SnapshotScopeKey &scope, uint64_t allocated, uint64_t committed) {
-            event_backend->ObserveAllocatedSnapshotVersion(scope, allocated);
-            event_backend->ObserveSnapshotVersion(scope, committed);
-        });
-    if (ec == EC_OK) {
+    lock.lock();
+    snapshot_version_recovering_instances_.erase(instance_id);
+    if (ec == EC_OK && event_backend) {
         snapshot_version_recovered_instances_.insert(instance_id);
     }
+    lock.unlock();
+    snapshot_version_recovery_cv_.notify_all();
     return ec;
 }
 
@@ -2718,7 +2734,8 @@ ErrorCode CacheManager::DoCleanup() {
     ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
     {
-        std::lock_guard<std::mutex> lock(snapshot_version_recovery_mutex_);
+        std::unique_lock<std::mutex> lock(snapshot_version_recovery_mutex_);
+        snapshot_version_recovery_cv_.wait(lock, [this] { return snapshot_version_recovering_instances_.empty(); });
         snapshot_version_recovered_instances_.clear();
     }
     {

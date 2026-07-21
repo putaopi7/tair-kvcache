@@ -552,6 +552,9 @@ bool EventReportBackend::CommitSnapshotVersion(const SnapshotScopeKey &scope, ui
 }
 
 void EventReportBackend::AbortSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version) {
+    if (version == 0 || scope.instance_id.empty() || scope.host_ip_port.empty() || scope.medium.empty()) {
+        return;
+    }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     auto it = snapshot_versions_.find(scope);
     if (it != snapshot_versions_.end() && it->second.in_flight == version) {

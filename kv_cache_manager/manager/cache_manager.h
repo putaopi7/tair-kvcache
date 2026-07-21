@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -346,6 +347,8 @@ private:
     std::atomic<bool> recover_retry_stop_{false};
     // 需要清理 - event snapshot 版本表由 event backend 内存维护，持久化版本恢复每个 instance 只做一次
     std::mutex snapshot_version_recovery_mutex_;
+    std::condition_variable snapshot_version_recovery_cv_;
+    std::set<std::string> snapshot_version_recovering_instances_;
     std::set<std::string> snapshot_version_recovered_instances_;
     struct SnapshotCleanupState {
         uint64_t latest_version = 0;

@@ -603,7 +603,7 @@ ErrorCode MetaAsyncRedisBackend::PutMetaData(const FieldMap &field_map) noexcept
             10, "async redis put metadata fail, fail to acquire client, instance[%s]", instance_id_.c_str());
         return EC_TIMEOUT;
     }
-    auto error_codes = handle->Set({metadata_key_}, {field_map});
+    auto error_codes = handle->Upsert({metadata_key_}, {field_map});
     if (error_codes.empty()) {
         return EC_ERROR;
     }

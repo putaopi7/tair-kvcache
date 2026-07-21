@@ -95,6 +95,9 @@ public:
         CacheLocationStatus status;
         std::vector<LocationSpec> specs;
     };
+    // The create and replace phases are idempotent but not transactional across
+    // keys. Callers that need atomic visibility must publish through an external
+    // generation commit marker after this method succeeds.
     ErrorCode BatchReplaceLocationSpecs(RequestContext *request_context,
                                         const KeyVector &keys,
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
@@ -151,6 +154,8 @@ public:
     ErrorCode VisitAllLocations(RequestContext *request_context, size_t scan_batch_size, LocationVisitor visitor);
     using LocationCleanupPredicate =
         std::function<bool(KeyType block_key, const std::string &location_id, const CacheLocation &location)>;
+    // Returning true from should_abort is a successful cancellation and therefore
+    // returns EC_OK; it is not a storage or scan failure.
     ErrorCode CleanupLocationsByPredicate(RequestContext *request_context,
                                           DataStorageType storage_type,
                                           size_t scan_batch_size,

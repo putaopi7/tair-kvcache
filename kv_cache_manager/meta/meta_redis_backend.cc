@@ -460,7 +460,7 @@ ErrorCode MetaRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {
             10, "put metadata fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return EC_TIMEOUT;
     }
-    auto error_codes = handle->Set({metadata_key_}, {field_map});
+    auto error_codes = handle->Upsert({metadata_key_}, {field_map});
     assert(error_codes.size() == 1);
     return error_codes[0];
 }
