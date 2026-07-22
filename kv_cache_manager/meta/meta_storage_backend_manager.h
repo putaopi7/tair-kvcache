@@ -81,6 +81,10 @@ public:
                        const int64_t limit,
                        std::string &out_next_cursor,
                        KeyTypeVec &out_keys) noexcept;
+    ErrorCode ScanLocationsForMaintenance(RequestContext *request_context,
+                                          const std::string &cursor,
+                                          int64_t limit,
+                                          MaintenanceScanBatch &out) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
     ErrorCode SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
 

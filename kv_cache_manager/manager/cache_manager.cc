@@ -140,6 +140,10 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
           meta_indexer_manager_, write_location_manager_, registry_manager_, metrics_lifecycle_)) {}
 
 CacheManager::~CacheManager() {
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->Stop();
+        cache_garbage_collector_.reset();
+    }
     ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
     if (write_location_manager_) {
@@ -158,11 +162,21 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                         uint64_t cache_reclaimer_del_batch_size,
                         uint32_t cache_reclaimer_idle_interval_ms,
                         uint32_t cache_reclaimer_worker_size,
-                        CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config) {
+                        CacheReclaimerAsyncDeleteConfig cache_reclaimer_async_delete_config,
+                        CacheGarbageCollector::Config cache_gc_config) {
     schedule_plan_executor_ = std::make_shared<SchedulePlanExecutor>(schedule_plan_executor_thread_count,
                                                                      meta_indexer_manager_,
                                                                      registry_manager_->data_storage_manager(),
                                                                      metrics_registry_);
+    cache_garbage_collector_ = std::make_shared<CacheGarbageCollector>(std::move(cache_gc_config),
+                                                                       registry_manager_,
+                                                                       meta_indexer_manager_,
+                                                                       schedule_plan_executor_,
+                                                                       metrics_registry_);
+    if (cache_garbage_collector_->Validate() != EC_OK) {
+        KVCM_LOG_ERROR("CacheManager init failed: invalid CacheGarbageCollector config");
+        return false;
+    }
     event_manager_ = std::make_shared<EventManager>();
     if (!event_manager_) {
         KVCM_LOG_WARN("create EventManager failed");
@@ -868,6 +882,22 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
 }
 void CacheManager::PauseReclaimer() { cache_reclaimer_->Pause(); }
 void CacheManager::ResumeReclaimer() { cache_reclaimer_->Resume(); }
+
+ErrorCode CacheManager::StartCacheGarbageCollector() {
+    return cache_garbage_collector_ ? cache_garbage_collector_->Start() : EC_ERROR;
+}
+
+void CacheManager::RequestStopCacheGarbageCollector() {
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->RequestStop();
+    }
+}
+
+void CacheManager::JoinCacheGarbageCollector() {
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->Join();
+    }
+}
 
 void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
                                             const std::vector<std::string> &location_spec_names) {
@@ -2093,6 +2123,9 @@ void CacheManager::ClearEventCleanupCallbacks() {
 }
 
 ErrorCode CacheManager::DoCleanup() {
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->Stop();
+    }
     ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
     // aborting write session need meta indexer

@@ -696,6 +696,36 @@ ErrorCode MetaStorageBackendManager::ListKeys(RequestContext *request_context,
     return persistent_backend_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
 }
 
+ErrorCode MetaStorageBackendManager::ScanLocationsForMaintenance(RequestContext *request_context,
+                                                                 const std::string &cursor,
+                                                                 const int64_t limit,
+                                                                 MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+    if (!persistent_backend_) {
+        KVCM_LOG_ERROR("maintenance scan failed, persistent backend is null, instance[%s]", instance_id_.c_str());
+        return EC_ERROR;
+    }
+
+    MaintenanceScanBatch batch;
+    ErrorCode ec = persistent_backend_->ScanLocationsForMaintenance(request_context, cursor, limit, batch);
+    if (ec != EC_OK) {
+        return ec;
+    }
+    if (batch.next_cursor.empty() || batch.keys.size() != batch.locations.size() ||
+        batch.keys.size() != batch.location_results.size()) {
+        KVCM_LOG_ERROR(
+            "maintenance scan result invalid, instance[%s] cursor_empty[%d] keys[%zu] locations[%zu] results[%zu]",
+            instance_id_.c_str(),
+            batch.next_cursor.empty(),
+            batch.keys.size(),
+            batch.locations.size(),
+            batch.location_results.size());
+        return EC_ERROR;
+    }
+    out = std::move(batch);
+    return EC_OK;
+}
+
 ErrorCode MetaStorageBackendManager::RandomSample(RequestContext *request_context,
                                                   const int64_t count,
                                                   KeyTypeVec &out_keys) noexcept {

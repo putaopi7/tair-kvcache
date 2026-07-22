@@ -67,13 +67,24 @@ bool Server::Init(const ServerConfig &config) {
     async_delete_config.pending_bytes_limit_per_group_type = config_.GetCacheReclaimerPendingBytesLimitPerGroupType();
     async_delete_config.pending_delete_handler_limit = config_.GetCacheReclaimerPendingDeleteHandlerLimit();
     async_delete_config.pending_bytes_limit = config_.GetCacheReclaimerPendingBytesLimit();
-    cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
-                         config_.GetCacheReclaimerKeySamplingSizeTotal(),
-                         config_.GetCacheReclaimerKeySamplingSizePerTask(),
-                         config_.GetCacheReclaimerDelBatchSize(),
-                         config_.GetCacheReclaimerIdleIntervalMs(),
-                         config_.GetCacheReclaimerWorkerSize(),
-                         async_delete_config);
+    CacheGarbageCollector::Config cache_gc_config;
+    cache_gc_config.enabled = config_.IsCacheGcEnabled();
+    cache_gc_config.scan_interval_ms = config_.GetCacheGcScanIntervalMs();
+    cache_gc_config.round_pause_ms = config_.GetCacheGcRoundPauseMs();
+    cache_gc_config.scan_batch_size = static_cast<size_t>(config_.GetCacheGcScanBatchSize());
+    cache_gc_config.orphan_writing_grace_period_ms = config_.GetCacheGcOrphanWritingGracePeriodMs();
+    cache_gc_config.max_inflight_delete_requests = static_cast<size_t>(config_.GetCacheGcMaxInflightDeleteRequests());
+    if (!cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
+                              config_.GetCacheReclaimerKeySamplingSizeTotal(),
+                              config_.GetCacheReclaimerKeySamplingSizePerTask(),
+                              config_.GetCacheReclaimerDelBatchSize(),
+                              config_.GetCacheReclaimerIdleIntervalMs(),
+                              config_.GetCacheReclaimerWorkerSize(),
+                              async_delete_config,
+                              cache_gc_config)) {
+        KVCM_LOG_ERROR("cache manager init failed");
+        return false;
+    }
     cache_manager_->PauseReclaimer(); // Resume after DoRecover
 
     // Set revisit interval histogram configuration
@@ -120,6 +131,11 @@ void Server::OnBecomeLeader() {
         KVCM_LOG_ERROR("cache_manager recover failed");
         return;
     }
+    ec = cache_manager_->StartCacheGarbageCollector();
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("cache garbage collector start failed, ec[%d]", static_cast<int>(ec));
+        return;
+    }
     cache_manager_->ResumeReclaimer();
 
     meta_impl_->EnableLeaderOnlyRequests();
@@ -129,6 +145,7 @@ void Server::OnBecomeLeader() {
 
 void Server::OnNoLongerLeader() {
     KVCM_LOG_INFO("Server demoted to standby, starting cleanup...");
+    cache_manager_->RequestStopCacheGarbageCollector();
     cache_manager_->PauseReclaimer();
 
     meta_impl_->DisableLeaderOnlyRequests();
@@ -137,6 +154,7 @@ void Server::OnNoLongerLeader() {
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
 
+    cache_manager_->JoinCacheGarbageCollector();
     ErrorCode ec = cache_manager_->DoCleanup();
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("cache_manager DoCleanup failed");

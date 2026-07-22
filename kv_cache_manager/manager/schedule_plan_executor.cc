@@ -495,7 +495,7 @@ bool SchedulePlanExecutor::FillActualTask(
 }
 SchedulePlanExecutor::LocationDelAdmissionResult
 SchedulePlanExecutor::PrepareDeleteTask(const CacheMetaDelRequest &task) {
-    return PrepareDeleteTaskImpl(task.instance_id, task.block_keys, nullptr, task.delay);
+    return PrepareDeleteTaskImpl(task.instance_id, task.block_keys, nullptr, task.delay, std::nullopt);
 }
 
 SchedulePlanExecutor::LocationDelAdmissionResult
@@ -508,14 +508,16 @@ SchedulePlanExecutor::PrepareDeleteTask(const CacheLocationDelRequest &task) {
                 "block_keys size %zu != location_ids size %zu", task.block_keys.size(), task.location_ids.size()));
         return admission_result;
     }
-    return PrepareDeleteTaskImpl(task.instance_id, task.block_keys, &task.location_ids, task.delay);
+    return PrepareDeleteTaskImpl(
+        task.instance_id, task.block_keys, &task.location_ids, task.delay, task.expected_status);
 }
 
 SchedulePlanExecutor::LocationDelAdmissionResult
 SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                                             const std::vector<int64_t> &block_keys,
                                             const std::vector<std::vector<std::string>> *target_location_ids,
-                                            std::chrono::microseconds delay) {
+                                            std::chrono::microseconds delay,
+                                            const std::optional<CacheLocationStatus> expected_status) {
     LocationDelAdmissionResult admission_result;
     admission_result.actual_task = CacheLocationDelRequest{instance_id, {}, {}, delay};
 
@@ -567,13 +569,18 @@ SchedulePlanExecutor::PrepareDeleteTaskImpl(const std::string &instance_id,
                 continue;
             }
             const auto &location = *loc_kv.second;
-            if (location.status() == CacheLocationStatus::CLS_DELETING) {
+            if (expected_status.has_value() && location.status() != expected_status.value()) {
+                continue;
+            }
+            if (!expected_status.has_value() && location.status() == CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
             if (target_location_ids != nullptr && target_ids.find(location.id()) == target_ids.end()) {
                 continue;
             }
-            location_cas_tasks.push_back({location.id(), location.status(), CacheLocationStatus::CLS_DELETING});
+            const CacheLocationStatus cas_expected_status =
+                expected_status.has_value() ? expected_status.value() : location.status();
+            location_cas_tasks.push_back({location.id(), cas_expected_status, CacheLocationStatus::CLS_DELETING});
         }
         if (location_cas_tasks.empty()) {
             continue;

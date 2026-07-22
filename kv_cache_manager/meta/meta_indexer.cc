@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -752,6 +753,30 @@ ErrorCode MetaIndexer::Scan(RequestContext *request_context,
             limit,
             out_next_cursor.c_str(),
             out_keys.size());
+    }
+    return ec;
+}
+
+ErrorCode MetaIndexer::ScanLocationsForMaintenance(RequestContext *request_context,
+                                                   const std::string &cursor,
+                                                   const size_t limit,
+                                                   MaintenanceScanBatch &out) noexcept {
+    out.Clear();
+    if (limit == 0 || limit > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+        KVCM_LOG_ERROR("instance[%s] maintenance scan invalid limit[%zu], cursor[%s]",
+                       instance_id_.c_str(),
+                       limit,
+                       cursor.c_str());
+        return EC_BADARGS;
+    }
+    ErrorCode ec =
+        backend_manager_->ScanLocationsForMaintenance(request_context, cursor, static_cast<int64_t>(limit), out);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("instance[%s] maintenance scan failed, cursor[%s] limit[%zu] ec[%d]",
+                       instance_id_.c_str(),
+                       cursor.c_str(),
+                       limit,
+                       ec);
     }
     return ec;
 }

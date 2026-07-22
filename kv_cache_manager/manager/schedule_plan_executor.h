@@ -7,6 +7,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <vector>
@@ -51,6 +52,10 @@ struct CacheLocationDelRequest {
     std::vector<int64_t> block_keys;
     std::vector<std::vector<std::string>> location_ids;
     std::chrono::microseconds delay{std::chrono::seconds(0)};
+    // When set, only locations currently in this status may enter the
+    // expected_status -> CLS_DELETING CAS. Existing callers leave it unset and
+    // retain the original "current status -> CLS_DELETING" behavior.
+    std::optional<CacheLocationStatus> expected_status;
 };
 
 struct ScheduledTask {
@@ -121,7 +126,8 @@ private:
     LocationDelAdmissionResult PrepareDeleteTaskImpl(const std::string &instance_id,
                                                      const std::vector<int64_t> &block_keys,
                                                      const std::vector<std::vector<std::string>> *target_location_ids,
-                                                     std::chrono::microseconds delay);
+                                                     std::chrono::microseconds delay,
+                                                     std::optional<CacheLocationStatus> expected_status);
     void RunDeleteAdmission(const std::shared_ptr<PromiseCompletion> &completion,
                             std::chrono::microseconds delay,
                             const std::function<LocationDelAdmissionResult()> &prepare);

@@ -1083,3 +1083,125 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncRejectedHasNoFuture) {
     EXPECT_FALSE(meta_submit_result.accepted);
     EXPECT_FALSE(meta_submit_result.future.valid());
 }
+
+TEST_F(SchedulePlanExecutorTest, TestExpectedStatusIsAppliedInSharedAdmission) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+
+    auto request_context = std::make_shared<RequestContext>("expected_status_test");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    auto make_location = [](const std::string &suffix) {
+        return SchedulePlanExecutorTestHelper::CreateCacheLocation(
+            DataStorageType::DATA_STORAGE_TYPE_NFS,
+            1,
+            {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc",
+                                                                "nfs://nfs_01/expected_status_" + suffix + "?size=1")});
+    };
+
+    std::vector<std::string> writing_ids;
+    std::vector<std::string> serving_ids;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchAddLocation(request_context.get(), {910}, {make_location("writing")}, writing_ids));
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchAddLocation(request_context.get(), {911}, {make_location("serving")}, serving_ids));
+    ASSERT_EQ(1, writing_ids.size());
+    ASSERT_EQ(1, serving_ids.size());
+
+    std::vector<std::vector<ErrorCode>> update_results;
+    ASSERT_EQ(
+        ErrorCode::EC_OK,
+        meta_searcher.BatchUpdateLocationStatus(
+            request_context.get(), {911}, {{{serving_ids.front(), CacheLocationStatus::CLS_SERVING}}}, update_results));
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    CacheLocationDelRequest conditional_request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {910, 911},
+        .location_ids = {{writing_ids.front()}, {serving_ids.front()}},
+        .expected_status = CacheLocationStatus::CLS_WRITING,
+    };
+    auto submit_result = executor.SubmitAsync(conditional_request);
+    ASSERT_TRUE(submit_result.accepted);
+    ASSERT_TRUE(submit_result.future.valid());
+    const auto conditional_result = submit_result.future.get();
+    EXPECT_TRUE(conditional_result.status == ErrorCode::EC_OK || conditional_result.status == ErrorCode::EC_PARTIAL_OK)
+        << conditional_result.error_message;
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {910, 911}, empty_mask, location_maps));
+    ASSERT_EQ(2, location_maps.size());
+    EXPECT_TRUE(location_maps[0].empty());
+    ASSERT_EQ(1, location_maps[1].size());
+    EXPECT_EQ(CacheLocationStatus::CLS_SERVING, location_maps[1].at(serving_ids.front())->status());
+
+    // Leaving expected_status unset preserves the existing current-status CAS behavior.
+    CacheLocationDelRequest compatible_request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {911},
+        .location_ids = {{serving_ids.front()}},
+    };
+    const auto compatible_result = executor.Submit(compatible_request).get();
+    EXPECT_TRUE(compatible_result.status == ErrorCode::EC_OK || compatible_result.status == ErrorCode::EC_PARTIAL_OK)
+        << compatible_result.error_message;
+    location_maps.clear();
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {911}, empty_mask, location_maps));
+    EXPECT_TRUE(location_maps.empty() || location_maps.front().empty());
+}
+
+TEST_F(SchedulePlanExecutorTest, TestFinishWinsBeforeConditionalAsyncAdmission) {
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer(kTestInstanceName, "local"));
+    ASSERT_EQ(ErrorCode::EC_OK, CreateDataStorage());
+
+    auto request_context = std::make_shared<RequestContext>("finish_before_gc_admission_test");
+    MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
+    auto location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS,
+        1,
+        {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc",
+                                                            "nfs://nfs_01/finish_before_gc_admission?size=1")});
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(request_context.get(), {912}, {location}, location_ids));
+    ASSERT_EQ(1, location_ids.size());
+
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    std::promise<void> blocker_started;
+    std::promise<void> release_blocker;
+    const auto release_future = release_blocker.get_future().share();
+    ASSERT_TRUE(executor.SubmitTask([&blocker_started, release_future]() {
+        blocker_started.set_value();
+        release_future.wait_for(std::chrono::seconds(2));
+    }));
+    ASSERT_EQ(std::future_status::ready, blocker_started.get_future().wait_for(std::chrono::seconds(1)));
+
+    CacheLocationDelRequest request{
+        .instance_id = kTestInstanceName,
+        .block_keys = {912},
+        .location_ids = {{location_ids.front()}},
+        .expected_status = CacheLocationStatus::CLS_WRITING,
+    };
+    auto submit_result = executor.SubmitAsync(request);
+    ASSERT_TRUE(submit_result.accepted);
+    ASSERT_TRUE(submit_result.future.valid());
+
+    std::vector<std::vector<ErrorCode>> update_results;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchUpdateLocationStatus(request_context.get(),
+                                                      {912},
+                                                      {{{location_ids.front(), CacheLocationStatus::CLS_SERVING}}},
+                                                      update_results));
+
+    release_blocker.set_value();
+    const auto result = submit_result.future.get();
+    EXPECT_EQ(ErrorCode::EC_OK, result.status) << result.error_message;
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher.BatchGetLocation(request_context.get(), {912}, empty_mask, location_maps));
+    ASSERT_EQ(1, location_maps.size());
+    ASSERT_EQ(1, location_maps.front().size());
+    EXPECT_EQ(CacheLocationStatus::CLS_SERVING, location_maps.front().at(location_ids.front())->status());
+}
