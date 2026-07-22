@@ -92,7 +92,7 @@ message BlockDeleteEventParams {
 message BlockSnapshotItem {
     string block_key = 1;
     string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
-    repeated LocationSpec specs = 3; // complete spec set for this block location
+    repeated LocationSpec specs = 3;
 }
 
 message BlockSnapshotEventParams {
