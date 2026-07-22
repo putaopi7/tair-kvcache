@@ -1,6 +1,7 @@
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 
 #include <memory>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
@@ -389,6 +390,21 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
         HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped.");
         return future;
     }
+    if (task.block_keys.size() != task.location_ids.size() ||
+        (!task.expected_location_values.empty() &&
+         task.block_keys.size() != task.expected_location_values.size())) {
+        HandleErrorPromise(promise, ErrorCode::EC_BADARGS, "invalid conditional location delete request shape");
+        return future;
+    }
+    if (!task.expected_location_values.empty()) {
+        for (size_t i = 0; i < task.location_ids.size(); ++i) {
+            if (task.location_ids[i].size() != task.expected_location_values[i].size()) {
+                HandleErrorPromise(
+                    promise, ErrorCode::EC_BADARGS, "location ids and expected values size mismatch at index %zu", i);
+                return future;
+            }
+        }
+    }
 
     std::shared_ptr<MetaIndexer> indexer = meta_manager_->GetMetaIndexer(task.instance_id);
     if (!indexer) {
@@ -412,6 +428,13 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
     for (size_t block_key_idx = 0; block_key_idx < task.block_keys.size(); ++block_key_idx) {
         std::unordered_set<std::string> target_location_ids(task.location_ids[block_key_idx].begin(),
                                                             task.location_ids[block_key_idx].end());
+        std::unordered_map<std::string, std::string> expected_location_values;
+        if (!task.expected_location_values.empty()) {
+            for (size_t i = 0; i < task.location_ids[block_key_idx].size(); ++i) {
+                expected_location_values.emplace(task.location_ids[block_key_idx][i],
+                                                 task.expected_location_values[block_key_idx][i]);
+            }
+        }
         auto block_key = task.block_keys[block_key_idx];
         auto &location_map = location_maps[block_key_idx];
         std::vector<MetaSearcher::LocationCASTask> location_cas_tasks;
@@ -426,7 +449,18 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
             if (target_location_ids.find(location.id()) == target_location_ids.end()) {
                 continue; // ignore not target location
             }
-            location_cas_tasks.push_back({location.id(), location.status(), CacheLocationStatus::CLS_DELETING});
+            std::string expected_location_value;
+            if (!expected_location_values.empty()) {
+                const auto expected = expected_location_values.find(location.id());
+                if (expected == expected_location_values.end() || location.ToJsonString() != expected->second) {
+                    continue; // stable location was refreshed after the cleanup scan
+                }
+                expected_location_value = expected->second;
+            }
+            location_cas_tasks.push_back({location.id(),
+                                          location.status(),
+                                          CacheLocationStatus::CLS_DELETING,
+                                          std::move(expected_location_value)});
         }
         if (location_cas_tasks.empty()) {
             continue;

@@ -264,7 +264,7 @@ private:
                               const std::string &host_ip_port,
                               uint64_t cleanup_generation,
                               DataStorageType storage_type);
-    ErrorCode CleanupStaleSnapshotLocations(const SnapshotScopeKey &scope,
+    ErrorCode CleanupStaleSnapshotLocations(const ReporterSnapshotKey &reporter_key,
                                             const std::string &snapshot_version,
                                             DataStorageType storage_type,
                                             const std::shared_ptr<EventReportBackend> &event_backend);

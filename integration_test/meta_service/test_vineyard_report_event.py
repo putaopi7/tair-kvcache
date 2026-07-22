@@ -178,13 +178,12 @@ def _ev_block_delete(block_key, medium, spec_names):
     }
 
 
-def _ev_block_snapshot(medium, blocks):
-    """Build one authoritative snapshot; medium is a block-level attribute."""
+def _ev_block_snapshot(blocks):
+    """Build one all-medium authoritative snapshot."""
     snapshot_blocks = []
     for block in blocks:
         item = dict(block)
         item["block_key"] = str(item["block_key"])
-        item["medium"] = medium
         snapshot_blocks.append(item)
     return {
         "event_type": "EVENT_BLOCK_SNAPSHOT",
@@ -325,7 +324,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             _make_request(
                 cls.instance_id,
                 cls.HOST,
-                [_ev_block_snapshot("mem", [])],
+                [_ev_block_snapshot([])],
                 "setup_initial_snapshot",
             )
         )
@@ -339,9 +338,17 @@ class EventReportFunctionalTest(unittest.TestCase):
                     "global_unique_name": cls.EVENT_REPORT_STORAGE_NAME,
                     "storage_type": "ST_EVENT_REPORT_L2",
                     "event_report": {
-                        "heartbeat_timeout_ms": 30000,
-                        "cleanup_grace_ms": 300000,
-                        "liveness_check_interval_ms": 5000,
+                        "heartbeat_timeout_ms": (
+                            HEARTBEAT_TIMEOUT_MS
+                            if ENABLE_LIVENESS_TIMING_TESTS else 30000
+                        ),
+                        "cleanup_grace_ms": (
+                            CLEANUP_GRACE_MS
+                            if ENABLE_LIVENESS_TIMING_TESTS else 300000
+                        ),
+                        "liveness_check_interval_ms": (
+                            100 if ENABLE_LIVENESS_TIMING_TESTS else 5000
+                        ),
                     },
                     "check_storage_available_when_open": False,
                 },
@@ -512,7 +519,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(
                 self.instance_id, host,
-                [_ev_block_snapshot("mem", [])],
+                [_ev_block_snapshot([])],
                 trace_id="t05_initial_snapshot",
             )
         )
@@ -563,7 +570,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(
                 self.instance_id, host,
-                [_ev_block_snapshot("mem", [])],
+                [_ev_block_snapshot([])],
                 trace_id="t05b_initial_snapshot",
             )
         )
@@ -668,7 +675,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(
                 self.instance_id, down_host,
-                [_ev_block_snapshot("mem", [])],
+                [_ev_block_snapshot([])],
                 trace_id="t08_initial_snapshot",
             )
         )
@@ -722,7 +729,7 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(
                 self.instance_id, host,
-                [_ev_block_snapshot("mem", [])],
+                [_ev_block_snapshot([])],
                 trace_id="t11_initial_snapshot",
             )
         )
@@ -821,12 +828,21 @@ class EventReportFunctionalTest(unittest.TestCase):
 
         host = "192.168.1.250:8080"
         block_key = 9100
-        # Step 1: register + add a event report replica.
+        # Step 1: register, then establish the reporter's initial snapshot.
         self.client.report_event(
-            _make_request(self.instance_id, host, [
-                _ev_node_register(["mem"]),
-                _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_event_report_uri(host, "mem"))),
-            ], trace_id="t16a_setup")
+            _make_request(
+                self.instance_id, host, [_ev_node_register(["mem"])],
+                trace_id="t16a_register",
+            )
+        )
+        self.client.report_event(
+            _make_request(self.instance_id, host, [_ev_block_snapshot([{
+                "block_key": block_key,
+                "medium": "mem",
+                "specs": _make_single_spec(
+                    "spec_4096", _build_event_report_uri(host, "mem")
+                ),
+            }])], trace_id="t16a_setup")
         )
         # Confirm the replica is queryable.
         resp = self.client.get_cache_location({
@@ -871,10 +887,19 @@ class EventReportFunctionalTest(unittest.TestCase):
         host = "192.168.1.251:8080"
         block_key = 9101
         self.client.report_event(
-            _make_request(self.instance_id, host, [
-                _ev_node_register(["mem"]),
-                _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_event_report_uri(host, "mem"))),
-            ], trace_id="t16b_setup")
+            _make_request(
+                self.instance_id, host, [_ev_node_register(["mem"])],
+                trace_id="t16b_register",
+            )
+        )
+        self.client.report_event(
+            _make_request(self.instance_id, host, [_ev_block_snapshot([{
+                "block_key": block_key,
+                "medium": "mem",
+                "specs": _make_single_spec(
+                    "spec_4096", _build_event_report_uri(host, "mem")
+                ),
+            }])], trace_id="t16b_setup")
         )
 
         # Wait past hb_timeout + cleanup_grace + scheduler slack.
@@ -948,7 +973,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             self.client.report_event(
                 _make_request(
                     instance_id, host,
-                    [_ev_block_snapshot("mem", [])],
+                    [_ev_block_snapshot([])],
                     trace_id="t16_initial_snapshot",
                 )
             )
@@ -1068,8 +1093,8 @@ class EventReportFunctionalTest(unittest.TestCase):
             version,
         )
 
-    # 18. Snapshot scope is (instance, reporter host); medium is per-block.
-    def test_18_snapshot_scope_isolation(self):
+    # 18. Snapshot state is isolated per reporter; medium is per-block.
+    def test_18_snapshot_reporter_isolation(self):
         host_a = "192.168.1.241:8080"
         host_b = "192.168.1.242:8080"
         versions = {}
@@ -1086,7 +1111,7 @@ class EventReportFunctionalTest(unittest.TestCase):
                 _make_request(
                     self.instance_id,
                     host,
-                    [_ev_block_snapshot("mem", [])],
+                    [_ev_block_snapshot([])],
                     trace_id="t18_snapshot_" + host,
                 )
             )
@@ -1098,7 +1123,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             _make_request(
                 self.instance_id,
                 host_a,
-                [_ev_block_snapshot("mem", [])],
+                [_ev_block_snapshot([])],
                 trace_id="t18_rate_limited",
             ),
             check_ok=False,
@@ -1197,7 +1222,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             _make_request(
                 self.instance_id,
                 host,
-                [_ev_block_snapshot("mem", [])],
+                [_ev_block_snapshot([])],
                 trace_id="t19_empty_snapshot",
             )
         )
@@ -1220,8 +1245,9 @@ class EventReportFunctionalTest(unittest.TestCase):
             _make_request(
                 self.instance_id,
                 bad_host,
-                [_ev_block_snapshot("mem", [{
+                [_ev_block_snapshot([{
                     "block_key": "9192",
+                    "medium": "mem",
                     "specs": _make_single_spec("linear_0", bad_uri),
                 }])],
                 trace_id="t19_reserved_s_version",
@@ -1251,7 +1277,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             _make_request(
                 self.instance_id,
                 host,
-                [_ev_block_snapshot("mem", [])],
+                [_ev_block_snapshot([])],
                 trace_id="t20_first_snapshot",
             )
         )
@@ -1302,7 +1328,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             _make_request(
                 self.instance_id,
                 host,
-                [_ev_block_snapshot("mem", [])],
+                [_ev_block_snapshot([])],
                 trace_id="t20_second_snapshot",
             )
         )
@@ -1327,6 +1353,82 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertEqual(
             accepted_delta.get("committed_snapshot_version"), second_token
         )
+
+    def test_21_snapshot_request_shape_is_rejected_before_write_gate(self):
+        host = "192.168.1.245:8080"
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_node_register(["mem"])],
+                trace_id="t21_register",
+            )
+        )
+        snapshot = _ev_block_snapshot([{
+            "block_key": "9210",
+            "medium": "mem",
+            "specs": _make_single_spec(
+                "linear_0", _build_event_report_uri(host, "mem")
+            ),
+        }])
+        delta = _ev_block_add(
+            "9211",
+            "mem",
+            _make_single_spec(
+                "linear_0", _build_event_report_uri(host, "mem")
+            ),
+        )
+
+        mixed = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [snapshot, delta],
+                trace_id="t21_mixed_snapshot_delta",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            mixed["header"]["status"]["code"], "INVALID_ARGUMENT"
+        )
+
+        duplicate = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_snapshot([]), _ev_block_snapshot([])],
+                trace_id="t21_two_snapshots",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            duplicate["header"]["status"]["code"], "INVALID_ARGUMENT"
+        )
+
+        still_requires_snapshot = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [delta],
+                trace_id="t21_delta_after_invalid_requests",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            still_requires_snapshot["header"]["status"]["code"],
+            "SNAPSHOT_REQUIRED",
+        )
+
+        committed = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [snapshot],
+                trace_id="t21_valid_snapshot",
+            )
+        )
+        self.assertEqual(len(committed["committed_snapshot_version"]), 32)
+
 # ---------------------------------------------------------------------------
 # Bench tests
 # ---------------------------------------------------------------------------
@@ -1356,12 +1458,26 @@ class EventReportBenchTest(unittest.TestCase):
 
     @staticmethod
     def _ensure_host_registered(client, instance_id, host):
-        # Pre-register so subsequent BLOCK_ADDs hit "node already known".
+        # Register and establish the initial snapshot so deltas are accepted.
         client.report_event(
             _make_request(instance_id, host,
                           [_ev_node_register(["mem"])],
                           trace_id="bench_setup")
         )
+        client.report_event(
+            _make_request(instance_id, host, [_ev_block_snapshot([])],
+                          trace_id="bench_initial_snapshot")
+        )
+
+    @staticmethod
+    def _raise_for_report_error(resp):
+        resp.raise_for_status()
+        body = resp.json()
+        code = body.get("header", {}).get("status", {}).get("code")
+        if code not in ("OK", 1, "1", None):
+            raise AssertionError(
+                f"ReportEvent failed: code={code}, body={json.dumps(body)}"
+            )
 
     # 17. BLOCK_ADD throughput (one item per request)
     def test_17_block_add_throughput(self):
@@ -1388,7 +1504,7 @@ class EventReportBenchTest(unittest.TestCase):
                 t0 = time.monotonic()
                 try:
                     resp = session.post(f"{BASE_URL}/api/reportEvent", json=payload)
-                    resp.raise_for_status()
+                    self._raise_for_report_error(resp)
                 except Exception as e:
                     errors.append(str(e))
                     continue
@@ -1445,7 +1561,7 @@ class EventReportBenchTest(unittest.TestCase):
                 t0 = time.monotonic()
                 try:
                     resp = session.post(f"{BASE_URL}/api/reportEvent", json=payload)
-                    resp.raise_for_status()
+                    self._raise_for_report_error(resp)
                 except Exception as e:
                     errors.append(str(e))
                     continue

@@ -106,6 +106,7 @@ ErrorCode EventReportBackend::Close() {
         node_generation_.clear();
         snapshot_versions_.clear();
     }
+    snapshot_state_cv_.notify_all();
     {
         std::lock_guard<std::mutex> lock(cleanup_cb_mutex_);
         cleanup_callback_ = nullptr;
@@ -199,7 +200,9 @@ ErrorCode EventReportBackend::UnregisterNode(const std::string &instance_id, con
         }
     }
     inst_it->second.erase(it);
-    snapshot_versions_.erase(SnapshotScopeKey{instance_id, host_ip_port});
+    snapshot_versions_.erase(ReporterSnapshotKey{instance_id, host_ip_port});
+    lock.unlock();
+    snapshot_state_cv_.notify_all();
     KVCM_LOG_INFO("EventReportBackend: node [%s] unregistered from storage [%s] for instance [%s]",
                   host_ip_port.c_str(),
                   config_.global_unique_name().c_str(),
@@ -457,36 +460,27 @@ std::string EventReportBackend::BuildLocationId(const std::string &medium, const
 bool EventReportBackend::ParseLocationId(const std::string &location_id,
                                          std::string &out_medium,
                                          std::string &out_host_ip_port) const {
-    static constexpr std::string_view kPrefix = "kvs#event_report#";
-    if (location_id.compare(0, kPrefix.size(), kPrefix) != 0) {
-        return false;
-    }
-    const size_t separator = location_id.find('#', kPrefix.size());
-    if (separator == std::string::npos) {
-        return false;
-    }
-    out_medium = location_id.substr(kPrefix.size(), separator - kPrefix.size());
-    out_host_ip_port = location_id.substr(separator + 1);
-    return !out_medium.empty() && !out_host_ip_port.empty() && out_medium.find('#') == std::string::npos &&
-           out_host_ip_port.find('#') == std::string::npos;
+    return ParseEventReportLocationId(location_id, out_medium, out_host_ip_port);
 }
 
 std::string EventReportBackend::HostSuffix(const std::string &host_ip_port) const { return "#" + host_ip_port; }
 
-ErrorCode EventReportBackend::BeginDeltaMutation(const SnapshotScopeKey &scope, std::string &out_committed_version) {
+ErrorCode EventReportBackend::BeginDeltaMutation(const ReporterSnapshotKey &reporter_key,
+                                                 std::string &out_committed_version) {
     out_committed_version.clear();
-    if (scope.instance_id.empty() || scope.host_ip_port.empty()) {
+    if (reporter_key.instance_id.empty() || reporter_key.host_ip_port.empty()) {
         return EC_BADARGS;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto it = snapshot_versions_.find(scope);
+    snapshot_state_cv_.wait(lock, [&] {
+        auto it = snapshot_versions_.find(reporter_key);
+        return it == snapshot_versions_.end() || it->second.in_flight.empty();
+    });
+    auto it = snapshot_versions_.find(reporter_key);
     if (it == snapshot_versions_.end()) {
         return EC_SNAPSHOT_REQUIRED;
     }
     auto &state = it->second;
-    if (!state.in_flight.empty()) {
-        return EC_SNAPSHOT_IN_PROGRESS;
-    }
     if (state.committed.empty()) {
         return EC_SNAPSHOT_REQUIRED;
     }
@@ -498,33 +492,35 @@ ErrorCode EventReportBackend::BeginDeltaMutation(const SnapshotScopeKey &scope, 
     return EC_OK;
 }
 
-void EventReportBackend::EndDeltaMutation(const SnapshotScopeKey &scope) {
+void EventReportBackend::EndDeltaMutation(const ReporterSnapshotKey &reporter_key) {
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto it = snapshot_versions_.find(scope);
+    auto it = snapshot_versions_.find(reporter_key);
     if (it == snapshot_versions_.end() || it->second.active_delta_mutations == 0) {
         KVCM_LOG_ERROR("EventReportBackend: unmatched delta mutation lease for instance [%s] host [%s]",
-                       scope.instance_id.c_str(),
-                       scope.host_ip_port.c_str());
+                       reporter_key.instance_id.c_str(),
+                       reporter_key.host_ip_port.c_str());
         return;
     }
     --it->second.active_delta_mutations;
+    const bool drained = it->second.active_delta_mutations == 0;
+    lock.unlock();
+    if (drained) {
+        snapshot_state_cv_.notify_all();
+    }
 }
 
-ErrorCode EventReportBackend::BeginSnapshot(const SnapshotScopeKey &scope,
+ErrorCode EventReportBackend::BeginSnapshot(const ReporterSnapshotKey &reporter_key,
                                             std::string &out_candidate_version,
                                             uint64_t &out_retry_after_ms) {
     out_candidate_version.clear();
     out_retry_after_ms = 0;
-    if (scope.instance_id.empty() || scope.host_ip_port.empty()) {
+    if (reporter_key.instance_id.empty() || reporter_key.host_ip_port.empty()) {
         return EC_BADARGS;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto &state = snapshot_versions_[scope];
+    auto &state = snapshot_versions_[reporter_key];
     if (!state.in_flight.empty()) {
         return EC_SNAPSHOT_IN_PROGRESS;
-    }
-    if (state.active_delta_mutations != 0) {
-        return EC_DELTA_IN_PROGRESS;
     }
     const int64_t now_ms = NowMillis();
     if (state.last_commit_ms > 0 && snapshot_min_interval_ms_ > 0) {
@@ -537,40 +533,69 @@ ErrorCode EventReportBackend::BeginSnapshot(const SnapshotScopeKey &scope,
     do {
         out_candidate_version = GenerateSnapshotVersionToken();
     } while (out_candidate_version == state.committed);
+    // Close the reporter's write gate before waiting for already admitted
+    // deltas. Deltas arriving from this point wait until commit or abort.
     state.in_flight = out_candidate_version;
+    snapshot_state_cv_.wait(lock, [&] {
+        auto it = snapshot_versions_.find(reporter_key);
+        return it == snapshot_versions_.end() || it->second.in_flight != out_candidate_version ||
+               it->second.active_delta_mutations == 0;
+    });
+    auto it = snapshot_versions_.find(reporter_key);
+    if (it == snapshot_versions_.end() || it->second.in_flight != out_candidate_version) {
+        out_candidate_version.clear();
+        return EC_SNAPSHOT_REQUIRED;
+    }
     return EC_OK;
 }
 
-bool EventReportBackend::CommitSnapshotVersion(const SnapshotScopeKey &scope, const std::string &version) {
+bool EventReportBackend::CommitSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version) {
     if (!IsValidSnapshotVersionToken(version)) {
         return false;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto it = snapshot_versions_.find(scope);
+    auto it = snapshot_versions_.find(reporter_key);
     if (it == snapshot_versions_.end() || it->second.in_flight != version) {
         return false;
     }
     it->second.committed = version;
     it->second.in_flight.clear();
     it->second.last_commit_ms = NowMillis();
+    lock.unlock();
+    snapshot_state_cv_.notify_all();
     return true;
 }
 
-void EventReportBackend::AbortSnapshotVersion(const SnapshotScopeKey &scope, const std::string &version) {
-    if (!IsValidSnapshotVersionToken(version) || scope.instance_id.empty() || scope.host_ip_port.empty()) {
+void EventReportBackend::AbortSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version) {
+    if (!IsValidSnapshotVersionToken(version) || reporter_key.instance_id.empty() || reporter_key.host_ip_port.empty()) {
         return;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto it = snapshot_versions_.find(scope);
+    auto it = snapshot_versions_.find(reporter_key);
     if (it != snapshot_versions_.end() && it->second.in_flight == version) {
         it->second.in_flight.clear();
+        lock.unlock();
+        snapshot_state_cv_.notify_all();
     }
 }
 
-std::string EventReportBackend::GetSnapshotVersion(const SnapshotScopeKey &scope) const {
+std::string EventReportBackend::GetSnapshotVersion(const ReporterSnapshotKey &reporter_key) const {
     std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto it = snapshot_versions_.find(scope);
+    auto it = snapshot_versions_.find(reporter_key);
     return it == snapshot_versions_.end() ? std::string{} : it->second.committed;
+}
+
+void EventReportBackend::GetSnapshotVersionTokens(const ReporterSnapshotKey &reporter_key,
+                                                  std::string &out_committed,
+                                                  std::string &out_in_flight) const {
+    out_committed.clear();
+    out_in_flight.clear();
+    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+    const auto it = snapshot_versions_.find(reporter_key);
+    if (it != snapshot_versions_.end()) {
+        out_committed = it->second.committed;
+        out_in_flight = it->second.in_flight;
+    }
 }
 
 void EventReportBackend::SetSnapshotMinIntervalMsForTest(int64_t interval_ms) {

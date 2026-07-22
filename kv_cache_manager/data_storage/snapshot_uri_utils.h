@@ -11,19 +11,22 @@ namespace kv_cache_manager {
 inline constexpr const char *KVCM_SNAPSHOT_VERSION_PARAM = "s_version";
 inline constexpr const char *KVCM_EVENT_REPORT_LOCATION_PREFIX = "kvs#event_report#";
 
-struct SnapshotScopeKey {
+// Identifies the one reporter whose complete cache set is replaced together.
+// This is an implementation key for versioning and mutual exclusion, not a
+// separately visible protocol object.
+struct ReporterSnapshotKey {
     std::string instance_id;
     std::string host_ip_port;
 
-    bool operator==(const SnapshotScopeKey &other) const noexcept {
+    bool operator==(const ReporterSnapshotKey &other) const noexcept {
         return instance_id == other.instance_id && host_ip_port == other.host_ip_port;
     }
 
-    bool operator!=(const SnapshotScopeKey &other) const noexcept { return !(*this == other); }
+    bool operator!=(const ReporterSnapshotKey &other) const noexcept { return !(*this == other); }
 };
 
-struct SnapshotScopeKeyHash {
-    size_t operator()(const SnapshotScopeKey &key) const {
+struct ReporterSnapshotKeyHash {
+    size_t operator()(const ReporterSnapshotKey &key) const {
         size_t seed = std::hash<std::string>{}(key.instance_id);
         seed ^= std::hash<std::string>{}(key.host_ip_port) + 0x9e3779b9U + (seed << 6) + (seed >> 2);
         return seed;
@@ -123,7 +126,7 @@ ParseEventReportLocationId(const std::string &location_id, std::string &out_medi
     }
     out_medium = location_id.substr(prefix_size, separator - prefix_size);
     out_host_ip_port = location_id.substr(separator + 1);
-    return !out_host_ip_port.empty();
+    return !out_host_ip_port.empty() && out_host_ip_port.find('#') == std::string::npos;
 }
 
 } // namespace kv_cache_manager

@@ -2131,7 +2131,7 @@ TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_NullExecutor) {
     cache_manager_->schedule_plan_executor_ = nullptr;
 
     auto func = cache_manager_->GetSubmitDelReqFunc("test_instance");
-    func({1, 2, 3}, {{"loc_a"}, {"loc_b"}, {"loc_c"}});
+    func({1, 2, 3}, {{"loc_a"}, {"loc_b"}, {"loc_c"}}, {});
 
     cache_manager_->schedule_plan_executor_ = saved;
 }
@@ -2180,7 +2180,7 @@ TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_DeletesLocationMetadata) {
 
     // use GetSubmitDelReqFunc to submit a deletion request
     auto del_func = cache_manager_->GetSubmitDelReqFunc("test_instance");
-    del_func(keys, loc_ids);
+    del_func(keys, loc_ids, {});
 
     // wait for the async executor to process the request
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -2361,6 +2361,11 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_AllStale) {
                                                createLocationSpecInfos(),
                                                createModelDeployment(),
                                                std::vector<LocationSpecGroup>()));
+
+    // This test inspects the queued delete request directly. Stop the
+    // supervisor so it cannot concurrently consume a future whose scheduled
+    // task is deliberately removed below.
+    cache_manager_->reclaimer_task_supervisor_->Stop();
 
     // write keys {1,2} and finish as CLS_SERVING
     std::vector<std::int64_t> write_keys{1, 2};

@@ -1,8 +1,10 @@
 #include <chrono>
+#include <future>
 #include <gtest/gtest.h>
 #include <memory>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
@@ -456,7 +458,7 @@ TEST_F(EventReportBackendTest, TwoInstancesSameHostIsolated) {
 
 TEST(EventReportBackendSnapshotTest, RequiresSnapshotBeforeAnyDelta) {
     EventReportBackend backend(nullptr);
-    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
+    const ReporterSnapshotKey scope{"instance-a", "10.0.0.1:8080"};
 
     std::string committed;
     EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(scope, committed));
@@ -467,7 +469,7 @@ TEST(EventReportBackendSnapshotTest, RequiresSnapshotBeforeAnyDelta) {
 TEST(EventReportBackendSnapshotTest, SnapshotCommitPublishesOpaqueToken) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);
-    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
+    const ReporterSnapshotKey scope{"instance-a", "10.0.0.1:8080"};
 
     std::string candidate;
     uint64_t retry_after_ms = 123;
@@ -485,41 +487,196 @@ TEST(EventReportBackendSnapshotTest, SnapshotCommitPublishesOpaqueToken) {
     backend.EndDeltaMutation(scope);
 }
 
-TEST(EventReportBackendSnapshotTest, SnapshotAndDeltaUseExplicitRetryableFences) {
+TEST(EventReportBackendSnapshotTest, SnapshotAndDeltaWaitForEachOther) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);
-    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
+    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.1:8080"};
 
     std::string first;
     uint64_t retry_after_ms = 0;
-    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, first, retry_after_ms));
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
 
-    std::string ignored;
-    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, backend.BeginDeltaMutation(scope, ignored));
     std::string concurrent_snapshot;
-    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, backend.BeginSnapshot(scope, concurrent_snapshot, retry_after_ms));
-    ASSERT_TRUE(backend.CommitSnapshotVersion(scope, first));
+    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, backend.BeginSnapshot(reporter_key, concurrent_snapshot, retry_after_ms));
 
-    std::string committed1;
-    std::string committed2;
-    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(scope, committed1));
-    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(scope, committed2));
-    EXPECT_EQ(first, committed1);
-    EXPECT_EQ(first, committed2);
+    std::promise<void> delta_started;
+    std::promise<std::pair<ErrorCode, std::string>> delta_result;
+    auto delta_result_future = delta_result.get_future();
+    std::thread delta_thread([&] {
+        delta_started.set_value();
+        std::string committed;
+        const ErrorCode ec = backend.BeginDeltaMutation(reporter_key, committed);
+        delta_result.set_value({ec, committed});
+    });
+    delta_started.get_future().wait();
+    EXPECT_EQ(std::future_status::timeout, delta_result_future.wait_for(20ms));
+    EXPECT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
+    const auto delta_status = delta_result_future.wait_for(1s);
+    EXPECT_EQ(std::future_status::ready, delta_status);
+    if (delta_status != std::future_status::ready) {
+        backend.Close();
+    }
+    const auto [delta_ec, delta_version] = delta_result_future.get();
+    EXPECT_EQ(EC_OK, delta_ec);
+    EXPECT_EQ(first, delta_version);
+    delta_thread.join();
 
-    std::string blocked_snapshot;
-    EXPECT_EQ(EC_DELTA_IN_PROGRESS, backend.BeginSnapshot(scope, blocked_snapshot, retry_after_ms));
-    backend.EndDeltaMutation(scope);
-    EXPECT_EQ(EC_DELTA_IN_PROGRESS, backend.BeginSnapshot(scope, blocked_snapshot, retry_after_ms));
-    backend.EndDeltaMutation(scope);
-    EXPECT_EQ(EC_OK, backend.BeginSnapshot(scope, blocked_snapshot, retry_after_ms));
-    backend.AbortSnapshotVersion(scope, blocked_snapshot);
+    // Release the delta lease acquired by delta_thread only after a new
+    // snapshot has closed the gate and started waiting for it.
+    std::promise<void> snapshot_started;
+    std::promise<std::tuple<ErrorCode, std::string, uint64_t>> snapshot_result;
+    auto snapshot_result_future = snapshot_result.get_future();
+    std::thread snapshot_thread([&] {
+        snapshot_started.set_value();
+        std::string candidate;
+        uint64_t retry_ms = 0;
+        const ErrorCode ec = backend.BeginSnapshot(reporter_key, candidate, retry_ms);
+        snapshot_result.set_value({ec, candidate, retry_ms});
+    });
+    snapshot_started.get_future().wait();
+    EXPECT_EQ(std::future_status::timeout, snapshot_result_future.wait_for(20ms));
+    backend.EndDeltaMutation(reporter_key);
+    const auto snapshot_status = snapshot_result_future.wait_for(1s);
+    EXPECT_EQ(std::future_status::ready, snapshot_status);
+    if (snapshot_status != std::future_status::ready) {
+        backend.Close();
+    }
+    const auto [snapshot_ec, candidate, retry_ms] = snapshot_result_future.get();
+    EXPECT_EQ(EC_OK, snapshot_ec);
+    EXPECT_TRUE(IsValidSnapshotVersionToken(candidate));
+    EXPECT_EQ(0u, retry_ms);
+    snapshot_thread.join();
+    backend.AbortSnapshotVersion(reporter_key, candidate);
+}
+
+TEST(EventReportBackendSnapshotTest, AbortUnblocksWaitingDeltaWithoutPublishingCandidate) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.1:8080"};
+
+    std::string first;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
+
+    std::string candidate;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms));
+    std::string observed_committed;
+    std::string observed_in_flight;
+    backend.GetSnapshotVersionTokens(reporter_key, observed_committed, observed_in_flight);
+    EXPECT_EQ(first, observed_committed);
+    EXPECT_EQ(candidate, observed_in_flight);
+    std::promise<std::pair<ErrorCode, std::string>> delta_result;
+    auto delta_result_future = delta_result.get_future();
+    std::thread delta_thread([&] {
+        std::string committed;
+        const ErrorCode ec = backend.BeginDeltaMutation(reporter_key, committed);
+        delta_result.set_value({ec, committed});
+    });
+    EXPECT_EQ(std::future_status::timeout, delta_result_future.wait_for(20ms));
+    backend.AbortSnapshotVersion(reporter_key, candidate);
+    backend.GetSnapshotVersionTokens(reporter_key, observed_committed, observed_in_flight);
+    EXPECT_EQ(first, observed_committed);
+    EXPECT_TRUE(observed_in_flight.empty());
+    const auto delta_status = delta_result_future.wait_for(1s);
+    EXPECT_EQ(std::future_status::ready, delta_status);
+    if (delta_status != std::future_status::ready) {
+        backend.Close();
+    }
+    const auto [delta_ec, committed] = delta_result_future.get();
+    EXPECT_EQ(EC_OK, delta_ec);
+    EXPECT_EQ(first, committed);
+    delta_thread.join();
+    backend.EndDeltaMutation(reporter_key);
+}
+
+TEST(EventReportBackendSnapshotTest, CommitUnblocksAllWaitingDeltasWithNewToken) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.1:8080"};
+
+    std::string candidate;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms));
+
+    constexpr size_t kWaiterCount = 4;
+    std::vector<std::future<std::pair<ErrorCode, std::string>>> futures;
+    futures.reserve(kWaiterCount);
+    for (size_t i = 0; i < kWaiterCount; ++i) {
+        futures.push_back(std::async(std::launch::async, [&backend, &reporter_key] {
+            std::string committed;
+            const ErrorCode ec = backend.BeginDeltaMutation(reporter_key, committed);
+            if (ec == EC_OK) {
+                backend.EndDeltaMutation(reporter_key);
+            }
+            return std::make_pair(ec, committed);
+        }));
+    }
+    for (auto &future : futures) {
+        EXPECT_EQ(std::future_status::timeout, future.wait_for(20ms));
+    }
+
+    ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, candidate));
+    for (auto &future : futures) {
+        ASSERT_EQ(std::future_status::ready, future.wait_for(1s));
+        const auto [ec, committed] = future.get();
+        EXPECT_EQ(EC_OK, ec);
+        EXPECT_EQ(candidate, committed);
+    }
+}
+
+TEST(EventReportBackendSnapshotTest, UnregisterUnblocksWaitingDeltaAndRequiresNewSnapshot) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const std::string instance_id = "instance-a";
+    const std::string host = "10.0.0.1:8080";
+    const ReporterSnapshotKey reporter_key{instance_id, host};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm"}));
+
+    std::string first;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
+    std::string second;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, second, retry_after_ms));
+
+    auto delta = std::async(std::launch::async, [&] {
+        std::string committed = "stale";
+        const ErrorCode ec = backend.BeginDeltaMutation(reporter_key, committed);
+        return std::make_pair(ec, committed);
+    });
+    EXPECT_EQ(std::future_status::timeout, delta.wait_for(20ms));
+    ASSERT_EQ(EC_OK, backend.UnregisterNode(instance_id, host));
+    ASSERT_EQ(std::future_status::ready, delta.wait_for(1s));
+    const auto [ec, committed] = delta.get();
+    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, ec);
+    EXPECT_TRUE(committed.empty());
+}
+
+TEST(EventReportBackendSnapshotTest, OtherReporterIsNotBlockedBySnapshot) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_a{"instance-a", "10.0.0.1:8080"};
+    const ReporterSnapshotKey reporter_b{"instance-a", "10.0.0.2:8080"};
+    uint64_t retry_after_ms = 0;
+
+    std::string token_b;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_b, token_b, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_b, token_b));
+
+    std::string token_a;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_a, token_a, retry_after_ms));
+    std::string committed_b;
+    EXPECT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_b, committed_b));
+    EXPECT_EQ(token_b, committed_b);
+    backend.EndDeltaMutation(reporter_b);
+    backend.AbortSnapshotVersion(reporter_a, token_a);
 }
 
 TEST(EventReportBackendSnapshotTest, AbortNeverPublishesAndWrongTokenCannotCommit) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);
-    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
+    const ReporterSnapshotKey scope{"instance-a", "10.0.0.1:8080"};
 
     std::string candidate;
     uint64_t retry_after_ms = 0;
@@ -540,7 +697,7 @@ TEST(EventReportBackendSnapshotTest, AbortNeverPublishesAndWrongTokenCannotCommi
 TEST(EventReportBackendSnapshotTest, SnapshotRateLimitReturnsRetryDelay) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(30'000);
-    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
+    const ReporterSnapshotKey scope{"instance-a", "10.0.0.1:8080"};
 
     std::string first;
     uint64_t retry_after_ms = 0;
@@ -561,9 +718,9 @@ TEST(EventReportBackendSnapshotTest, SnapshotRateLimitReturnsRetryDelay) {
 TEST(EventReportBackendSnapshotTest, ScopesAreIsolatedByInstanceAndReporterHost) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);
-    const SnapshotScopeKey scope_a{"instance-a", "10.0.0.1:8080"};
-    const SnapshotScopeKey scope_b{"instance-a", "10.0.0.2:8080"};
-    const SnapshotScopeKey scope_c{"instance-b", "10.0.0.1:8080"};
+    const ReporterSnapshotKey scope_a{"instance-a", "10.0.0.1:8080"};
+    const ReporterSnapshotKey scope_b{"instance-a", "10.0.0.2:8080"};
+    const ReporterSnapshotKey scope_c{"instance-b", "10.0.0.1:8080"};
 
     std::string token_a;
     std::string token_b;
@@ -589,7 +746,7 @@ TEST(EventReportBackendSnapshotTest, UnregisterForcesFullSnapshotAgain) {
     backend.SetSnapshotMinIntervalMsForTest(0);
     const std::string instance_id = "instance-a";
     const std::string host = "10.0.0.1:8080";
-    const SnapshotScopeKey scope{instance_id, host};
+    const ReporterSnapshotKey scope{instance_id, host};
 
     ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm", "dram"}));
     std::string token;
@@ -612,7 +769,7 @@ TEST(EventReportBackendSnapshotTest, FailedDeltaClearsOutputAndDoesNotCreateACom
     EXPECT_TRUE(committed.empty());
 
     committed = "stale-token";
-    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
+    const ReporterSnapshotKey scope{"instance-a", "10.0.0.1:8080"};
     EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(scope, committed));
     EXPECT_TRUE(committed.empty());
     EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
@@ -623,7 +780,7 @@ TEST(EventReportBackendSnapshotTest, UnregisterThenReregisterRequiresNewSnapshot
     backend.SetSnapshotMinIntervalMsForTest(0);
     const std::string instance_id = "instance-a";
     const std::string host = "10.0.0.1:8080";
-    const SnapshotScopeKey scope{instance_id, host};
+    const ReporterSnapshotKey scope{instance_id, host};
 
     ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm", "dram"}));
     std::string first_token;

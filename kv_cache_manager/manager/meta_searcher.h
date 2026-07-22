@@ -16,7 +16,8 @@
 namespace kv_cache_manager {
 
 using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk_keys,
-                                            const std::vector<std::vector<std::string>> &loc_ids)>;
+                                            const std::vector<std::vector<std::string>> &loc_ids,
+                                            const std::vector<std::vector<std::string>> &expected_location_values)>;
 
 class MetaIndexer;
 class LocationSpecGroup;
@@ -131,6 +132,10 @@ public:
         std::string location_id;
         CacheLocationStatus old_status;
         CacheLocationStatus new_status;
+        // Optional exact serialized value checked inside the metadata RMW.
+        // This closes the gap between a cleanup scan and its status CAS when
+        // a stable location id is refreshed by a newer snapshot.
+        std::string expected_location_value;
     };
     ErrorCode BatchCASLocationStatus(RequestContext *request_context,
                                      const KeyVector &keys,

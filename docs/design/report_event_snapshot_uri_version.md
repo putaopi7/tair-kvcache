@@ -1,14 +1,14 @@
 # ReportEvent 增量上报与权威快照对账设计
 
-> 状态：待设计评审。
-> 本文描述目标语义；设计确认后再继续修改代码和测试。
+> 状态：实现中。
+> 本文是 ReportEvent snapshot 的目标语义，代码、协议和测试以此为准。
 
 ## 1. 一句话说明
 
 ReportEvent 使用两条互补链路同步 KV Cache 元数据：
 
 - 日常变化走 `EVENT_BLOCK_ADD` / `EVENT_BLOCK_DELETE`；
-- 启动、周期校准、事件断档等场景走 `EVENT_BLOCK_SNAPSHOT`。
+- 首次建立基线、KVCM 重启恢复、事件断档和低频兜底校准走 `EVENT_BLOCK_SNAPSHOT`。
 
 Snapshot 是一个 reporter 在某一时刻、跨全部介质的完整 cache 事实，不是增量补丁，也不是历史版本存档。
 
@@ -16,9 +16,8 @@ Snapshot 是一个 reporter 在某一时刻、跨全部介质的完整 cache 事
 
 1. **增量负责效率，快照负责收敛。** ADD/DELETE 优化稳态写放大，snapshot 则是能够覆盖
    增量历史的权威事实；系统正确性不能永久依赖每一条增量事件都不丢失。
-2. **一致性边界跟随权威写入者。** 一个 reporter 独占维护某个 instance 在本机上的全部
-   cache 状态，因此版本、互斥栅栏、限频和失效都以该写入者为单位；存储介质只是这份
-   状态内部的属性，不是独立的一致性域。
+2. **一台 reporter 一次上报完整事实。** 一个 reporter 统一维护某个 instance 在本机上的
+   GPU、CPU 和 Disk cache；一次 snapshot 必须覆盖这些介质，`medium` 只是 block 属性。
 3. **可见性由提交版本决定，而不是由物理写入完成度决定。** KVCM 先把新版本写入 URI，
    全部写入成功后才发布 committed token；查询只接受 token 匹配的数据，旧数据或失败
    写入留下的数据都不可被误认为当前事实。
@@ -54,7 +53,7 @@ KVCM 是 KV Cache metadata control plane，不传输真实 KV tensor，也不替
 flowchart LR
     Engine["RTP-LLM / vLLM / V6D"] --> Adapter["Reporter / Subscriber"]
     Adapter -->|"ADD / DELETE（高频）"| ReportEvent["KVCM ReportEvent"]
-    Adapter -->|"SNAPSHOT（启动、周期、异常）"| ReportEvent
+    Adapter -->|"SNAPSHOT（建基线、重启、断档、低频兜底）"| ReportEvent
     ReportEvent --> Meta["block -> locations -> specs"]
     ReportEvent --> Version["EventReportBackend<br/>in-memory committed version"]
     Meta --> Query["cache-aware query"]
@@ -75,64 +74,27 @@ Engine 的 cache version、event sequence 或 epoch 与本文的 KVCM snapshot v
 - source watermark 证明 Engine 快照与后续事件的先后关系；
 - KVCM snapshot version 标识哪一轮 metadata 对账已经提交。
 
-## 4. Scope 的推导：以权威写入者为一致性边界
+## 4. 一次全量更新覆盖哪些数据
 
-### 4.1 先确定谁对数据负责
+Snapshot 要表达的是：某个 reporter 此刻为某个 instance 保存的完整 cache 集合。当前部署
+中，一个 Subscriber/reporter 能同时观察本机 GPU、CPU 和 Disk cache，因此这些介质必须
+放在同一次 snapshot 中上报；空 `blocks` 表示该 reporter 的全部 cache 都已经为空。
 
-Snapshot 要回答的不是“某种介质上有哪些 block”，而是：
-
-> 某个 cache reporter 此刻声明自己负责的完整 cache 集合是什么？
-
-在当前部署模型中，一个 Subscriber/reporter 统一观察同一 instance 在一台推理节点上的
-GPU、CPU 和 Disk cache，并负责把这台节点的变化按序上报给 KVCM。它是这组 metadata
-的唯一权威写入者，也是发生重启、断连、HOST_DOWN 和重新注册的生命周期单元。
-
-因此，一致性 scope 定义为：
-
-```text
-snapshot scope = instance_id + reporter host_ip_port
-```
-
-两个字段分别解决不同的隔离问题：
+KVCM 内部用 `(instance_id, reporter host_ip_port)` 找到这名写入者的 committed token、写门
+和限频状态。这只是实现中的查找键，不增加一个需要 Subscriber 理解的 “scope” 协议对象：
 
 - `instance_id` 隔离不同模型实例或 cache namespace；
-- `reporter host_ip_port` 标识该 instance 下独立的写入者和故障域。
+- `reporter host_ip_port` 标识实际提交这份完整事实的写入者；
+- `medium` 只描述 block 位于 HBM、DRAM 还是 Disk，保留在 `BlockSnapshotItem` 和 stable
+  location id 中，不参与 token、写门或限频。
 
-这里的 `host_ip_port` 是 reporter identity，不只是物理机器地址。设计要求同一 scope 同时
-只能有一个活跃写入者；如果未来同一节点允许多个进程独立拥有 cache，必须为它们分配
-不同的 reporter identity，或显式扩展 scope，不能让多个写入者共用一个 token。
+由此得到的行为很直接：
 
-### 4.2 为什么 medium 不属于 scope
-
-`medium` 决定 block 位于 HBM、DRAM 还是 Disk，是数据的寻址和放置属性，但它不是独立
-的写入者、故障域或生命周期单元。同一个 reporter 能在同一时刻观察全部介质，所以一份
-host snapshot 应当同时声明全部介质的事实。
-
-如果把 `medium` 放进 scope，会产生并不需要的中间状态：例如 HBM 已提交 v2、DRAM 仍停
-留在 v1，查询看到的是同一 reporter 不同时刻的拼接结果；Subscriber 还必须分别维护多套
-token、重试和栅栏。对当前单 reporter 架构而言，这既没有增加真实性，也削弱了“完整
-host snapshot”的含义。
-
-所以 `medium` 只保留在 `BlockSnapshotItem` 和 stable location id 中，不参与：
-
-- committed version 状态；
-- snapshot 频率限制；
-- snapshot/delta 并发栅栏；
-- scope 生命周期和失效。
-
-### 4.3 Scope 带来的协议约束
-
-由上述所有权边界直接得到以下约束：
-
-- 同一 scope 的 GPU、CPU、Disk 必须在一个 snapshot 中完整上报并共享同一个 committed
-  token；空 `blocks` 表示该 reporter 的全部介质均为空。
-- 同一 scope 内 snapshot 与 delta 必须互斥，避免 snapshot 基线与其间增量互相覆盖；
-  不同 scope 没有共同写入者，可以并行执行。
-- REGISTER 只刷新已有 reporter 的存活状态，不重置 token；HOST_DOWN、显式注销或 KVCM
-  重启会使 scope 的 committed token 失效，重新注册后必须先完成新 snapshot。
-- 限频按 scope 执行，防止单个异常 reporter 影响其他节点。
-- location id 仍包含 `medium`，因为查询和清理需要定位物理介质；这与版本 scope 是否包含
-  `medium` 是两个不同问题。
+- 同一 reporter 的 snapshot 和 ADD/DELETE 串行执行，避免全量基线覆盖并发增量；
+- 不同 instance 或不同 reporter 没有共同写入数据，可以并行；
+- REGISTER 只刷新存活状态，不重置 token；HOST_DOWN、显式注销或 KVCM 重启会使内存
+  token 失效，reporter 必须重新提交完整 snapshot；
+- 同一 reporter 若未来拆成多个独立 cache 进程，必须使用不同的 reporter identity。
 
 `host_ip_port` 必须取自 `ReportEventRequest.host_ip_port`。数据 URI 的 host 可能是实际
 存储服务地址，不能替代 reporter identity。
@@ -268,13 +230,13 @@ instance、reporter 和 medium 已经分别存在于请求上下文、stable loc
 - `s_version` 是 KVCM 保留参数，reporter 输入预带该参数时拒绝；
 - 同一个 location 内的 specs 必须使用相同 `s_version`；
 - 参数缺失、重复、非法或不等于当前 committed version 时 fail closed；
-- scope 校验使用请求 instance 和 stable location id，不从物理 URI host 反推 reporter。
+- reporter 身份与版本校验使用请求 instance 和 stable location id，不从物理 URI host 反推。
 
-因此版本过滤必须放在同时拿得到 `instance_id + location_id + LocationSpec` 的 MetaSearcher/CacheManager 查询路径。只接收 `DataStorageUri`、看不到 location 上下文的 `EventReportBackend::MightExist` 不能再独立完成 scope/version 判定；它应接收显式 scope/token，或把这部分过滤交给上层。
+因此版本过滤必须放在同时拿得到 `instance_id + location_id + LocationSpec` 的 MetaSearcher/CacheManager 查询路径。只接收 `DataStorageUri`、看不到 location 上下文的 `EventReportBackend::MightExist` 不能独立判断 reporter 和 version；它应接收明确的 reporter key/token，或把过滤交给上层。
 
 ## 7. Version 只保存在内存
 
-每个 `(instance_id, reporter host_ip_port)` scope 在 `EventReportBackend` 中保存当前 committed version，不再写入 instance metadata。
+`EventReportBackend` 按 `(instance_id, reporter host_ip_port)` 保存当前 committed version，不再写入 instance metadata。
 
 版本仍使用不可复用的 opaque token，推荐 UUIDv7/128-bit：
 
@@ -309,7 +271,7 @@ bool snapshot_required = 6;
 
 - snapshot 成功：返回本次新 token；
 - snapshot 失败或 partial：返回失败前的 committed token；
-- ADD、DELETE、REGISTER、HEARTBEAT：返回该 scope 当前 committed token；
+- ADD、DELETE、REGISTER、HEARTBEAT：返回该 reporter 当前 committed token；
 - KVCM 启动后尚未收到该 reporter 的完整 snapshot：version 为空且 `snapshot_required=true`；
 - 被频率限制时：同时返回当前 committed token 和建议等待时间。
 
@@ -334,7 +296,7 @@ sequenceDiagram
 
     S->>C: EVENT_BLOCK_SNAPSHOT(all media)
     C->>C: 校验完整 host snapshot
-    C->>E: 检查频率并获取 host-level snapshot fence
+    C->>E: 检查频率并关闭该 reporter 的增量写门
     E-->>C: 生成 opaque version N
     C->>M: stable location 原地覆盖，URI s_version=N
     C->>M: Sync 本次全部 keys
@@ -347,8 +309,8 @@ sequenceDiagram
 严格顺序：
 
 1. 完整校验 snapshot；
-2. 检查 per-scope 最小间隔；
-3. 获取 `(instance_id, reporter)` 的 snapshot fence；
+2. 检查该 reporter 的最小 snapshot 间隔；
+3. 关闭 `(instance_id, reporter)` 的增量写门，并等待已经进入的增量结束；
 4. 生成不可复用 version N；
 5. 为全部 block 构造带 N 的 URI；
 6. 按 stable location 单阶段覆盖完整 specs；
@@ -399,7 +361,7 @@ Cache 不是唯一副本，短暂的 cache miss 只会退化为重新计算或�
 
 1. 查询上下文提供 instance；
 2. stable location id 能否解析出 medium 和 reporter；
-3. URI 的 `s_version` 是否等于该 host scope 的内存 committed token；
+3. URI 的 `s_version` 是否等于该 reporter 的内存 committed token；
 4. reporter 是否已经完成重启后的必需 snapshot；
 5. reporter 节点是否可用。
 
@@ -415,65 +377,65 @@ Cache 不是唯一副本，短暂的 cache miss 只会退化为重新计算或�
 
 查询过滤负责即时正确性；Reclaimer 只负责空间回收。
 
-## 12. 跨请求栅栏与专用错误码
+## 12. 全量更新期间阻塞增量
 
-### 12.1 Host-level 栅栏
+### 12.1 Reporter 写门
 
-同一 `(instance_id, reporter)` scope 维护：
+同一 `(instance_id, reporter)` 的 snapshot 和 ADD/DELETE 共用一把写门，执行顺序如下：
 
-- 最多一个 `in_flight snapshot`；
-- `active_delta_mutations` 引用计数；
-- 当前 committed token。
+1. CacheManager 先在内存完成字段校验、重复 block 检查、URI 解析和请求规范化。非法请求
+   不关闭写门，也不影响正常增量；
+2. `BeginSnapshot` 检查限频、生成 candidate token，并立即标记 snapshot in flight，关闭
+   后续增量入口；
+3. 已经取得 lease 的增量继续完成，snapshot 等待 `active_delta_mutations` 降为 0；
+4. 此后到达的 ADD/DELETE 在条件变量上等待，不向 Subscriber 返回 busy 错误；
+5. snapshot 只在写门关闭期间追加 `s_version`、批量覆盖 metadata、`Sync` 并发布 token；
+6. commit 或 abort 都重新打开写门并唤醒等待者。commit 后的增量继承新 token，abort 后的
+   增量继续使用旧 token；
+7. cleanup 扫描和 reclaimer 任务在写门打开后异步执行，绝不能延长阻塞时间。
 
-规则：
+不同 instance 或 reporter 使用不同写门，可以并行。第二个并发 snapshot 不排队，因为两份
+全量事实没有可靠的先后 watermark；它返回 `SNAPSHOT_IN_PROGRESS`，由 Subscriber 合并或
+稍后重发最新的一份。
 
-- 有 active delta 时 snapshot 不能开始；
-- snapshot in flight 时 ADD/DELETE 不能开始；
-- delta lease 固定当前 committed token；
-- delta URI 使用固定 token；
-- 同一 reporter 的不同 medium 共用一把栅栏；
-- 不同 reporter 或 instance 可以并行。
+写门内路径必须尽可能短，不能执行请求解析、全量 cleanup 扫描、reclaimer 删除、监控上报
+或人为退避。阻塞保证的是同一写入者的全量与增量不会互相覆盖，不是跨 reporter 的全局锁。
 
-### 12.2 专用可重试错误码
+### 12.2 仍需区分的错误
 
-新增协议错误码：
+协议保留以下 snapshot 专用错误：
 
 ```protobuf
 SNAPSHOT_IN_PROGRESS = 11;
-DELTA_IN_PROGRESS = 12;
+reserved 12;
 SNAPSHOT_RATE_LIMITED = 13;
 SNAPSHOT_REQUIRED = 14;
 ```
 
-建议内部错误码一一对应：
-
-```text
-EC_SNAPSHOT_IN_PROGRESS
-EC_DELTA_IN_PROGRESS
-EC_SNAPSHOT_RATE_LIMITED
-EC_SNAPSHOT_REQUIRED
-```
-
 返回规则：
 
-- snapshot 已在途，delta 请求返回 `SNAPSHOT_IN_PROGRESS`；
-- delta lease 活跃，snapshot 请求返回 `DELTA_IN_PROGRESS`；
-- 距离上次成功 snapshot 太近，返回 `SNAPSHOT_RATE_LIMITED` 和 `retry_after_ms`；
-- KVCM 重启后、reporter 尚未重建基线时，REGISTER/HEARTBEAT 响应携带 `snapshot_required=true`，ADD/DELETE 返回 `SNAPSHOT_REQUIRED`；
-- 字段非法仍返回 `INVALID_ARGUMENT`；
-- 存储故障返回 `INTERNAL_ERROR` 或对应 IO 错误。
+- 第二个 snapshot 与当前 snapshot 冲突时返回 `SNAPSHOT_IN_PROGRESS`；
+- 距离上次成功 snapshot 太近时返回 `SNAPSHOT_RATE_LIMITED` 和 `retry_after_ms`；
+- KVCM 重启后、reporter 尚未重建基线时，REGISTER/HEARTBEAT 响应携带
+  `snapshot_required=true`，ADD/DELETE 返回 `SNAPSHOT_REQUIRED`；
+- 字段非法返回 `INVALID_ARGUMENT`；存储故障返回 `INTERNAL_ERROR` 或对应 IO 错误。
 
-Subscriber 按错误类型处理：
+Subscriber 对 rate limit 按 `retry_after_ms` 等待，对 snapshot required 立即拉取并上报完整
+snapshot，对 invalid argument 不做无限重试。失败重试必须重发完整 snapshot。
 
-- busy 错误使用短抖动退避；
-- rate limited 等待 `retry_after_ms`；
-- snapshot required 立即拉取并上报完整 host snapshot，成功前不发送 delta；
-- invalid argument 不自动无限重试；
-- snapshot 重试必须重发完整 host snapshot。
+## 13. 尽可能少触发 Snapshot
 
-## 13. Snapshot 频率限制
+Snapshot 是修复基线的低频手段，不是常规轮询接口。Subscriber 只应在以下情况触发：
 
-`EventReportBackend` 为每个 host-level scope 维护最小 snapshot 间隔：
+1. 首次启动，需要在发送增量前建立完整基线；
+2. KVCM 重启并返回 `snapshot_required=true`；
+3. Subscriber 检测到事件断档、乱序，或已经无法信任本地增量基线；
+4. 运维明确要求进行一次全量纠偏；
+5. 可选的超低频周期兜底，必须带随机抖动，且不应替代事件断档检测。
+
+正常 ADD/DELETE、HEARTBEAT、REGISTER 刷新和每次本地 cache 变化都不能触发 snapshot。
+
+`EventReportBackend` 仍为每个 reporter 维护最小 snapshot 间隔：
 
 ```text
 snapshot_min_interval = 30s  // 默认值，可配置
@@ -488,7 +450,8 @@ snapshot_min_interval = 30s  // 默认值，可配置
 - KVCM 返回剩余 `retry_after_ms`；
 - Subscriber 仍应增加随机抖动，避免多个 host 整点同时上报。
 
-频率限制主要防止 Subscriber bug 或错误配置把 full snapshot 当成高频轮询写接口。它不是 Subscriber 正常调度的替代品。
+30 秒只是防止 Subscriber bug 或错误配置压垮 Redis 的安全下限，不是建议的 snapshot 周期。
+正常运行时 snapshot 间隔应远大于该值，并优先由异常和恢复事件触发。
 
 频率状态不持久化。KVCM 重启后必须先完成一次重建 snapshot，这次 snapshot 不受重启前的间隔限制；之后重新开始内存计时。
 
@@ -501,12 +464,19 @@ snapshot_min_interval = 30s  // 默认值，可配置
 snapshot commit 成功后：
 
 1. 使用现有 MetaIndexer 分页扫描该 instance 的 block metadata；
-2. 找出 reporter 属于当前 scope、URI `s_version` 不等于 committed=N 的 location；
+2. 找出属于该 reporter、URI `s_version` 不等于 committed=N 的 location；
 3. 按现有 `CacheLocationDelRequest` 或等价删除请求分批；
 4. 提交给现有 `reclaimer_task_supervisor_->Submit(...)`；
 5. 删除、`EC_NOENT`、容量扣减和实际 metadata mutation 复用现有 reclaimer 路径。
 
 Reclaimer 不解析 token 大小，只比较是否等于当前 committed token。
+
+因为 location id 会被下一轮 snapshot 原地复用，扫描结果不能变成无条件删除。扫描时先
+同时读取 committed 和 in-flight token，当前 in-flight 数据一律不选为清理目标；清理任务
+还会携带扫描时观察到的序列化 location 值。既有 reclaimer 在把 location 从 `SERVING`
+改成 `DELETING` 前做 compare-and-set。若下一轮 snapshot 已经刷新 specs、version 或状态，
+比较失败，本次旧清理跳过该 location。两层保护保证 cleanup 与下一轮 snapshot 重叠时也
+不会按旧的扫描结果删除新版本。
 
 ### 14.2 崩溃与重试
 
@@ -606,8 +576,8 @@ KVCM 重启会要求 10 个 host 全部重新 snapshot，相当于至少触发�
 以下任一情况持续多个窗口时，应评估引入可 rebuild 的 `location_id -> block_key set`：
 
 - `snapshot_cleanup_scan_latency_p99 > 10s`；
-- 同 scope 的上一轮 cleanup 尚未结束，下一轮 snapshot 已到达；
-- cleanup backlog 持续超过一个 snapshot 周期；
+- 同一 reporter 的上一轮 cleanup 尚未结束，下一轮 snapshot 已到达；
+- cleanup backlog 持续超过正常的低频 snapshot 间隔；
 - cleanup scan 占 Redis 读请求或带宽超过 20%；
 - instance 增长导致 `N / host_blocks` 很大，扫描绝大部分数据都与目标 host 无关。
 
@@ -629,16 +599,16 @@ KVCM 重启会要求 10 个 host 全部重新 snapshot，相当于至少触发�
 1. 先部署理解 `s_version`、snapshot-required 恢复协议、专用错误码和 response version 的 KVCM；
 2. 再部署能产生单个跨 medium host snapshot 的 Subscriber；
 3. 小流量开启启动 snapshot；
-4. 再开启带随机抖动的低频周期对账；
+4. 仅在需要时开启带随机抖动的超低频兜底对账；
 5. 观察 partial、rate-limit、cleanup scan 和 reclaimer backlog。
 
 ## 18. 测试计划
 
 ### 18.1 单元测试
 
-Scope 与协议：
+Reporter 与协议：
 
-- scope 只含 instance/host；
+- 内部状态按 instance/reporter 隔离，不暴露额外协议对象；
 - 一个 snapshot 同时包含 HBM/Memory/Disk；
 - medium 从 block 读取；
 - item 字段为 block_key=1、medium=2、specs=3，外层 blocks=1；
@@ -651,7 +621,7 @@ Location、URI 与 token：
 - 两轮 snapshot 的 location id 完全不变；
 - versioned location 构造/解析接口不存在；
 - URI 只追加 `s_version`；
-- scope 从查询上下文与 stable location id 获取，不依赖物理 URI host；
+- reporter 从查询上下文与 stable location id 获取，不依赖物理 URI host；
 - UUID/token 不复用；
 - `s_version` 重复、非法或不匹配时 fail closed；
 - snapshot-required 状态下旧数据全部不可见。
@@ -668,12 +638,14 @@ Location、URI 与 token：
 
 并发、错误码和限流：
 
-- snapshot in flight 时 delta 返回 `SNAPSHOT_IN_PROGRESS`；
-- active delta 时 snapshot 返回 `DELTA_IN_PROGRESS`；
+- snapshot in flight 时，新 delta 阻塞，commit 后继承新 token；
+- snapshot in flight 时，新 delta 阻塞，abort 后继承旧 token；
+- active delta 未结束时 snapshot 先关闭新 delta 入口，再等待 active delta drain；
+- 第二个并发 snapshot 返回 `SNAPSHOT_IN_PROGRESS`；
 - 成功 snapshot 后 30 秒内返回 `SNAPSHOT_RATE_LIMITED`；
 - 重启后 delta 返回 `SNAPSHOT_REQUIRED`；
 - 失败 snapshot 可立即重试；
-- 不同 scope 并行；
+- 不同 instance/reporter 并行；
 - `retry_after_ms` 递减且边界正确。
 
 Reclaimer：
@@ -684,6 +656,8 @@ Reclaimer：
 - `EC_NOENT` 幂等；
 - 清理中断后查询仍正确；
 - 下一次 snapshot 再触发残留清理；
+- cleanup 扫描后 location 被下一轮 snapshot 原地刷新时，条件删除必须跳过新值；
+- cleanup 扫描遇到下一轮 snapshot 的 in-flight token 时不能把它选为旧数据；
 - 不存在 snapshot 专用调度/退避状态。
 
 ### 18.2 集成测试
@@ -730,21 +704,22 @@ Reclaimer：
 
 实现必须满足：
 
-1. scope 只有 instance_id + reporter host_ip_port；
+1. 内部状态只按 instance_id + reporter host_ip_port 隔离，不引入额外协议对象；
 2. 一个 snapshot 覆盖 reporter 的全部 medium；
 3. medium 是 block 属性，不参与 version 和 fence；
 4. location id 不含 version；
-5. URI 只追加 `s_version`，scope 不在 URI 中重复编码；
+5. URI 只追加 `s_version`，instance/reporter 不在 URI 中重复编码；
 6. committed token 只保存在 EventReportBackend 内存，不写 instance metadata；
 7. token 不复用，未提交 token 永远不会被误激活；
 8. committed 只有在全部写入 Sync 成功后更新；
 9. 响应明确返回 committed token 与 snapshot-required 状态；
 10. KVCM 重启后旧数据不可见，所有 reporter 必须重新 snapshot；
-11. snapshot 与同 scope delta 不并发，并返回专用可重试错误码；
-12. snapshot 受 per-scope 最小间隔保护；
+11. snapshot 先关闭增量写门并等待已有 delta，后续 delta 阻塞到 commit/abort；
+12. 并发 snapshot 返回专用可重试错误，snapshot 受 per-reporter 最小间隔保护；
 13. 旧数据删除复用现有 reclaimer；
-14. cleanup 失败不影响查询正确性；
-15. Subscriber 未拿到完整多介质事实时不能发送权威 snapshot。
+14. cleanup 使用观察值条件删除，不能删除后来写入同一 location id 的新版本；
+15. cleanup 失败不影响查询正确性；
+16. Subscriber 未拿到完整多介质事实时不能发送权威 snapshot。
 
 ## 21. 非目标
 
@@ -761,4 +736,4 @@ Reclaimer：
 - 多写 leader 分布式共识；
 - KVCM 主动删除远端物理 KV tensor。
 
-本设计以“host scope + stable location + URI `s_version` + in-memory committed token + restart re-report + existing reclaimer”保证最终收敛，并明确接受原地覆盖失败和 KVCM 重启期间的短暂 cache miss。
+本设计以“完整 reporter snapshot + stable location + URI `s_version` + in-memory committed token + restart re-report + existing reclaimer”保证最终收敛，并明确接受原地覆盖失败和 KVCM 重启期间的短暂 cache miss。

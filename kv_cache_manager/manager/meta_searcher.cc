@@ -78,8 +78,8 @@ std::vector<LocationSpec> MergeLocationSpecsByName(const std::vector<LocationSpe
 
     std::map<std::string, LocationSpec> merged_specs;
     for (const auto &spec : old_specs) {
-        // Once a scope has a committed snapshot token, delta writes may only
-        // carry forward specs from that same token.
+        // Once a reporter has a committed snapshot token, delta writes may
+        // only carry forward specs from that same token.
         if (has_snapshot_version) {
             SnapshotUriInfo old_snapshot_info;
             if (!ParseSnapshotUriInfo(spec.uri(), old_snapshot_info) ||
@@ -418,7 +418,7 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
     }
 
     if (!prune_keys.empty() && submit_del_req_func_) {
-        submit_del_req_func_(prune_keys, prune_loc_ids_vec);
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec, {});
     }
 
     return EC_OK;
@@ -496,7 +496,7 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     }
 
     if (!prune_keys.empty() && submit_del_req_func_) {
-        submit_del_req_func_(prune_keys, prune_loc_ids_vec);
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec, {});
     }
 
     return out_locations.size() == keys.size() ? EC_OK : EC_ERROR;
@@ -656,7 +656,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
     }
 
     if (!prune_keys.empty() && submit_del_req_func_) {
-        submit_del_req_func_(prune_keys, prune_loc_ids_vec);
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec, {});
     }
 
     return has_error ? EC_ERROR : EC_OK;
@@ -730,7 +730,7 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
     }
 
     if (!prune_keys.empty() && submit_del_req_func_) {
-        submit_del_req_func_(prune_keys, prune_loc_ids_vec);
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec, {});
     }
 
     return EC_OK;
@@ -1562,7 +1562,9 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
                 continue;
             }
             const auto &task = batch_tasks[key_index][loc_index];
-            if (locs[loc_index]->status() != task.old_status) {
+            if ((!task.expected_location_value.empty() &&
+                 locs[loc_index]->ToJsonString() != task.expected_location_value) ||
+                locs[loc_index]->status() != task.old_status) {
                 modifier_ecs[loc_index] = ErrorCode::EC_MISMATCH;
             } else {
                 updated = true;
@@ -1846,6 +1848,7 @@ ErrorCode MetaSearcher::CleanupLocationsByPredicate(RequestContext *request_cont
                 has_failure = true;
             }
             LocationIdsPerKey delete_location_ids(keys.size());
+            std::vector<std::vector<std::string>> expected_location_values(keys.size());
             bool has_deletes = false;
             for (size_t i = 0; i < keys.size(); ++i) {
                 if (i >= location_maps.size() || i >= get_result.error_codes.size() ||
@@ -1859,6 +1862,7 @@ ErrorCode MetaSearcher::CleanupLocationsByPredicate(RequestContext *request_cont
                     }
                     if (should_delete(keys[i], location_id, *location)) {
                         delete_location_ids[i].push_back(location_id);
+                        expected_location_values[i].push_back(location->ToJsonString());
                         has_deletes = true;
                     }
                 }
@@ -1868,7 +1872,7 @@ ErrorCode MetaSearcher::CleanupLocationsByPredicate(RequestContext *request_cont
                     KVCM_LOG_WARN("CleanupLocationsByPredicate: reclaimer submit callback is unavailable");
                     return EC_ERROR;
                 }
-                submit_del_req_func_(keys, delete_location_ids);
+                submit_del_req_func_(keys, delete_location_ids, expected_location_values);
             }
         }
         cursor = next_cursor;

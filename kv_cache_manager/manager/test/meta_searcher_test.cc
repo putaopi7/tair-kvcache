@@ -36,6 +36,7 @@ public:
 
 CheckLocDataExistFunc dummy_check_loc_data_exist = [](const CacheLocation &) -> bool { return true; };
 SubmitDelReqFunc dummy_submit_del_req = [](const std::vector<std::int64_t> &,
+                                           const std::vector<std::vector<std::string>> &,
                                            const std::vector<std::vector<std::string>> &) -> void {};
 
 class FaultyGetLocationIdsBackend : public MetaLocalBackend {
@@ -978,6 +979,40 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatus) {
         EXPECT_EQ(results.size(), 1);                  // 每个key只有一个任务
         EXPECT_EQ(results[0], ErrorCode::EC_MISMATCH); // 应该失败，因为状态不匹配
     }
+}
+
+TEST_F(MetaSearcherTest, TestBatchCASLocationStatusChecksExactLocationValue) {
+    MetaSearcher::KeyVector keys = {150};
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    CacheLocationVector locations = {location};
+    std::vector<std::string> location_ids;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, location_ids));
+    ASSERT_EQ(1u, location_ids.size());
+
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> mismatch_tasks = {{
+        MetaSearcher::LocationCASTask{
+            location_ids[0], CLS_WRITING, CLS_DELETING, "stale serialized location"},
+    }};
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, mismatch_tasks, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_MISMATCH}}), results);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
+    ASSERT_EQ(CLS_WRITING, location_maps[0].at(location_ids[0])->status());
+
+    const std::string expected_value = location_maps[0].at(location_ids[0])->ToJsonString();
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> matching_tasks = {{
+        MetaSearcher::LocationCASTask{location_ids[0], CLS_WRITING, CLS_DELETING, expected_value},
+    }};
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchCASLocationStatus(request_context_.get(), keys, matching_tasks, results));
+    ASSERT_EQ((std::vector<std::vector<ErrorCode>>{{EC_OK}}), results);
 }
 
 TEST_F(MetaSearcherTest, TestBatchCADLocationStatus) {

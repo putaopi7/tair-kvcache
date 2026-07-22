@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
@@ -67,14 +68,20 @@ public:
     bool ParseLocationId(const std::string &location_id, std::string &out_medium, std::string &out_host_ip_port) const;
     std::string HostSuffix(const std::string &host_ip_port) const;
     // A delta lease pins the committed token until every metadata mutation in
-    // that ReportEvent request has completed.
-    ErrorCode BeginDeltaMutation(const SnapshotScopeKey &scope, std::string &out_committed_version);
-    void EndDeltaMutation(const SnapshotScopeKey &scope);
+    // that ReportEvent request has completed. If this reporter is replacing
+    // its full snapshot, new deltas wait for commit/abort instead of racing it.
+    ErrorCode BeginDeltaMutation(const ReporterSnapshotKey &reporter_key, std::string &out_committed_version);
+    void EndDeltaMutation(const ReporterSnapshotKey &reporter_key);
     ErrorCode
-    BeginSnapshot(const SnapshotScopeKey &scope, std::string &out_candidate_version, uint64_t &out_retry_after_ms);
-    bool CommitSnapshotVersion(const SnapshotScopeKey &scope, const std::string &version);
-    void AbortSnapshotVersion(const SnapshotScopeKey &scope, const std::string &version);
-    std::string GetSnapshotVersion(const SnapshotScopeKey &scope) const;
+    BeginSnapshot(const ReporterSnapshotKey &reporter_key,
+                  std::string &out_candidate_version,
+                  uint64_t &out_retry_after_ms);
+    bool CommitSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version);
+    void AbortSnapshotVersion(const ReporterSnapshotKey &reporter_key, const std::string &version);
+    std::string GetSnapshotVersion(const ReporterSnapshotKey &reporter_key) const;
+    void GetSnapshotVersionTokens(const ReporterSnapshotKey &reporter_key,
+                                  std::string &out_committed,
+                                  std::string &out_in_flight) const;
     void SetSnapshotMinIntervalMsForTest(int64_t interval_ms);
     DataStorageType GetStorageType() const;
 
@@ -107,14 +114,15 @@ private:
     // instance_id -> (host_ip_port -> generation)
     std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> node_generation_;
     struct SnapshotVersionState {
-        // Process-local scope state, not a distributed lock. KVCM restart clears
+        // Process-local reporter state, not a distributed lock. KVCM restart clears
         // this state and requires the reporter to rebuild it with a full snapshot.
         std::string committed;
         std::string in_flight;
         uint64_t active_delta_mutations = 0;
         int64_t last_commit_ms = 0;
     };
-    std::unordered_map<SnapshotScopeKey, SnapshotVersionState, SnapshotScopeKeyHash> snapshot_versions_;
+    std::unordered_map<ReporterSnapshotKey, SnapshotVersionState, ReporterSnapshotKeyHash> snapshot_versions_;
+    std::condition_variable_any snapshot_state_cv_;
     int64_t snapshot_min_interval_ms_ = 30'000;
 
     std::thread liveness_checker_thread_;

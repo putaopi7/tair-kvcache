@@ -46,6 +46,9 @@ struct CacheLocationDelRequest {
     std::vector<int64_t> block_keys;
     std::vector<std::vector<std::string>> location_ids;
     std::chrono::microseconds delay{std::chrono::seconds(0)};
+    // Optional serialized values observed by the submitter, parallel to
+    // location_ids. A location is reclaimed only if it is still unchanged.
+    std::vector<std::vector<std::string>> expected_location_values;
 };
 
 struct ScheduledTask {
