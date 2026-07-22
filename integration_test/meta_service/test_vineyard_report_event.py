@@ -182,7 +182,7 @@ def _ev_heartbeat(system_status=None):
     }
 
 
-def _make_request(instance_id, host_ip_port, events, trace_id="test", storage_type="ST_EVENT_REPORT"):
+def _make_request(instance_id, host_ip_port, events, trace_id="test", storage_type="ST_EVENT_REPORT_L2"):
     return {
         "trace_id": trace_id,
         "instance_id": instance_id,
@@ -233,6 +233,7 @@ class EventReportFunctionalTest(unittest.TestCase):
                 "trace_id": "setup_storage",
                 "storage": {
                     "global_unique_name": cls.EVENT_REPORT_STORAGE_NAME,
+                    "storage_type": "ST_EVENT_REPORT_L2",
                     "event_report": {
                         "heartbeat_timeout_ms": 30000,
                         "cleanup_grace_ms": 300000,
@@ -587,7 +588,7 @@ class EventReportFunctionalTest(unittest.TestCase):
                 "instance_id": self.instance_id,
                 "host_ip_port": "",
                 "events": [_ev_node_register(["mem"])],
-                "storage_type": "ST_EVENT_REPORT",
+                "storage_type": "ST_EVENT_REPORT_L2",
             },
             check_ok=False,
         )

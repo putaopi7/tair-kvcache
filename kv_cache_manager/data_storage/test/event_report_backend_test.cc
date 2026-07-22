@@ -18,13 +18,15 @@ class EventReportBackendTest : public TESTBASE {
 public:
     void SetUp() override { metrics_registry_ = std::make_shared<MetricsRegistry>(); }
 
-    static StorageConfig
-    MakeConfig(int64_t hb_timeout_ms = 200, int64_t cleanup_grace_ms = 400, int64_t check_interval_ms = 50) {
+    static StorageConfig MakeConfig(int64_t hb_timeout_ms = 200,
+                                    int64_t cleanup_grace_ms = 400,
+                                    int64_t check_interval_ms = 50,
+                                    DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5) {
         auto spec = std::make_shared<EventReportStorageSpec>();
         spec->set_heartbeat_timeout_ms(hb_timeout_ms);
         spec->set_cleanup_grace_ms(cleanup_grace_ms);
         spec->set_liveness_check_interval_ms(check_interval_ms);
-        return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, "event_report_test_group", spec);
+        return StorageConfig(type, "event_report_test_group", spec);
     }
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -51,16 +53,27 @@ TEST_F(EventReportBackendTest, BasicAccessors) {
 
     // After Open(), GetType() returns the configured type
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(), "trace"));
-    ASSERT_EQ(backend.GetType(), DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
+    ASSERT_EQ(backend.GetType(), DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     ASSERT_TRUE(backend.Available());
     ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(EventReportBackendTest, BuildLocationIdIncludesEventReportType) {
+    EventReportBackend l1p5_backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, l1p5_backend.Open(MakeConfig(), "trace"));
+    EXPECT_EQ("kvs#event_report_l1p5#mem#10.0.0.1:8080", l1p5_backend.BuildLocationId("mem", "10.0.0.1:8080"));
+
+    EventReportBackend l2_backend(metrics_registry_);
+    ASSERT_EQ(EC_OK,
+              l2_backend.Open(MakeConfig(200, 400, 50, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2), "trace"));
+    EXPECT_EQ("kvs#event_report_l2#mem#10.0.0.1:8080", l2_backend.BuildLocationId("mem", "10.0.0.1:8080"));
 }
 
 TEST_F(EventReportBackendTest, OpenWithWrongSpecTypeFails) {
     EventReportBackend backend(metrics_registry_);
     auto spec = std::make_shared<NfsStorageSpec>();
     spec->set_root_path("/tmp");
-    StorageConfig cfg(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, "event_report_test", spec);
+    StorageConfig cfg(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, "event_report_test", spec);
     ASSERT_NE(EC_OK, backend.Open(cfg, "trace"));
     ASSERT_FALSE(backend.Available());
 }
