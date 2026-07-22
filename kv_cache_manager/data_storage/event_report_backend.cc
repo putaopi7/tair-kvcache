@@ -1,12 +1,14 @@
 #include "kv_cache_manager/data_storage/event_report_backend.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -19,6 +21,26 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
+namespace {
+
+std::string GenerateSnapshotVersionToken() {
+    std::array<unsigned char, 16> bytes{};
+    std::random_device random;
+    for (auto &byte : bytes) {
+        byte = static_cast<unsigned char>(random());
+    }
+    bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0fU) | 0x40U);
+    bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3fU) | 0x80U);
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string token(bytes.size() * 2, '0');
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        token[i * 2] = kHex[bytes[i] >> 4];
+        token[i * 2 + 1] = kHex[bytes[i] & 0x0fU];
+    }
+    return token;
+}
+
+} // namespace
 
 EventReportBackend::EventReportBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
     : DataStorageBackend(std::move(metrics_registry)) {}
@@ -177,6 +199,7 @@ ErrorCode EventReportBackend::UnregisterNode(const std::string &instance_id, con
         }
     }
     inst_it->second.erase(it);
+    snapshot_versions_.erase(SnapshotScopeKey{instance_id, host_ip_port});
     KVCM_LOG_INFO("EventReportBackend: node [%s] unregistered from storage [%s] for instance [%s]",
                   host_ip_port.c_str(),
                   config_.global_unique_name().c_str(),
@@ -402,53 +425,10 @@ std::vector<bool> EventReportBackend::Exist(const std::vector<DataStorageUri> &s
 std::vector<bool> EventReportBackend::MightExist(const std::vector<DataStorageUri> &storage_uris) {
     std::vector<bool> result;
     result.reserve(storage_uris.size());
-    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
     for (const auto &uri : storage_uris) {
-        SnapshotUriInfo snapshot_info;
-        const bool has_snapshot_version = ParseSnapshotUriInfo(uri, snapshot_info);
-        SnapshotScopeKey reporter_scope;
-        const bool has_reporter_scope = ParseEventReportScopeFromUri(uri, reporter_scope);
-        if (HasEventReportInternalUriMetadata(uri) && !has_reporter_scope) {
-            result.push_back(false);
-            continue;
-        }
-        if (uri.HasParam(KVCM_SNAPSHOT_VERSION_PARAM) && !has_snapshot_version) {
-            result.push_back(false);
-            continue;
-        }
-        if (has_snapshot_version) {
-            auto version_it = snapshot_versions_.find(snapshot_info.scope);
-            if (version_it == snapshot_versions_.end() || version_it->second.committed == 0 ||
-                snapshot_info.version != version_it->second.committed) {
-                result.push_back(false);
-                continue;
-            }
-        }
-
-        if (has_reporter_scope || (uri.Valid() && !uri.GetHostName().empty())) {
-            const std::string host_ip_port = has_reporter_scope ? reporter_scope.host_ip_port : HostIpPortFromUri(uri);
-            bool available = false;
-            if (has_reporter_scope) {
-                auto inst_it = instance_nodes_.find(reporter_scope.instance_id);
-                if (inst_it != instance_nodes_.end()) {
-                    auto host_it = inst_it->second.find(host_ip_port);
-                    available = host_it != inst_it->second.end() && host_it->second &&
-                                host_it->second->available.load(std::memory_order_relaxed);
-                }
-            } else {
-                for (const auto &[inst_id, hosts] : instance_nodes_) {
-                    auto host_it = hosts.find(host_ip_port);
-                    if (host_it != hosts.end() && host_it->second &&
-                        host_it->second->available.load(std::memory_order_relaxed)) {
-                        available = true;
-                        break;
-                    }
-                }
-            }
-            result.push_back(available);
-        } else {
-            result.push_back(true);
-        }
+        SnapshotUriInfo info;
+        result.push_back(uri.Valid() &&
+                         (!uri.HasParam(KVCM_SNAPSHOT_VERSION_PARAM) || ParseSnapshotUriInfo(uri, info)));
     }
     return result;
 }
@@ -474,117 +454,123 @@ std::string EventReportBackend::BuildLocationId(const std::string &medium, const
     return result;
 }
 
-std::string EventReportBackend::BuildSnapshotLocationId(const std::string &medium,
-                                                        const std::string &host_ip_port,
-                                                        uint64_t version) const {
-    if (version == 0) {
-        return BuildLocationId(medium, host_ip_port);
-    }
-    return BuildEventReportLocationId(medium, host_ip_port, version);
-}
-
 bool EventReportBackend::ParseLocationId(const std::string &location_id,
                                          std::string &out_medium,
                                          std::string &out_host_ip_port) const {
-    return ParseEventReportLocationId(location_id, out_medium, out_host_ip_port);
+    static constexpr std::string_view kPrefix = "kvs#event_report#";
+    if (location_id.compare(0, kPrefix.size(), kPrefix) != 0) {
+        return false;
+    }
+    const size_t separator = location_id.find('#', kPrefix.size());
+    if (separator == std::string::npos) {
+        return false;
+    }
+    out_medium = location_id.substr(kPrefix.size(), separator - kPrefix.size());
+    out_host_ip_port = location_id.substr(separator + 1);
+    return !out_medium.empty() && !out_host_ip_port.empty() && out_medium.find('#') == std::string::npos &&
+           out_host_ip_port.find('#') == std::string::npos;
 }
 
 std::string EventReportBackend::HostSuffix(const std::string &host_ip_port) const { return "#" + host_ip_port; }
 
-bool EventReportBackend::BeginDeltaMutation(const SnapshotScopeKey &scope, uint64_t &out_committed_version) {
-    if (scope.instance_id.empty() || scope.host_ip_port.empty() || scope.medium.empty()) {
-        return false;
+ErrorCode EventReportBackend::BeginDeltaMutation(const SnapshotScopeKey &scope, std::string &out_committed_version) {
+    if (scope.instance_id.empty() || scope.host_ip_port.empty()) {
+        return EC_BADARGS;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     auto &state = snapshot_versions_[scope];
-    if (state.in_flight != 0 || state.active_delta_mutations == std::numeric_limits<uint64_t>::max()) {
-        return false;
+    if (!state.in_flight.empty()) {
+        return EC_SNAPSHOT_IN_PROGRESS;
+    }
+    if (state.committed.empty()) {
+        return EC_SNAPSHOT_REQUIRED;
+    }
+    if (state.active_delta_mutations == std::numeric_limits<uint64_t>::max()) {
+        return EC_ERROR;
     }
     ++state.active_delta_mutations;
     out_committed_version = state.committed;
-    return true;
+    return EC_OK;
 }
 
 void EventReportBackend::EndDeltaMutation(const SnapshotScopeKey &scope) {
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     auto it = snapshot_versions_.find(scope);
     if (it == snapshot_versions_.end() || it->second.active_delta_mutations == 0) {
-        KVCM_LOG_ERROR("EventReportBackend: unmatched delta mutation lease for instance [%s] host [%s] medium [%s]",
+        KVCM_LOG_ERROR("EventReportBackend: unmatched delta mutation lease for instance [%s] host [%s]",
                        scope.instance_id.c_str(),
-                       scope.host_ip_port.c_str(),
-                       scope.medium.c_str());
+                       scope.host_ip_port.c_str());
         return;
     }
     --it->second.active_delta_mutations;
 }
 
-uint64_t EventReportBackend::AllocateSnapshotVersion(const SnapshotScopeKey &scope) {
-    if (scope.instance_id.empty() || scope.host_ip_port.empty() || scope.medium.empty()) {
-        return 0;
+ErrorCode EventReportBackend::BeginSnapshot(const SnapshotScopeKey &scope,
+                                            std::string &out_candidate_version,
+                                            uint64_t &out_retry_after_ms) {
+    out_candidate_version.clear();
+    out_retry_after_ms = 0;
+    if (scope.instance_id.empty() || scope.host_ip_port.empty()) {
+        return EC_BADARGS;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     auto &state = snapshot_versions_[scope];
-    if (state.in_flight != 0 || state.active_delta_mutations != 0) {
-        return 0;
+    if (!state.in_flight.empty()) {
+        return EC_SNAPSHOT_IN_PROGRESS;
     }
-    const uint64_t latest = std::max(state.allocated, state.committed);
-    if (latest == std::numeric_limits<uint64_t>::max()) {
-        return 0;
+    if (state.active_delta_mutations != 0) {
+        return EC_DELTA_IN_PROGRESS;
     }
-    state.allocated = latest + 1;
-    state.in_flight = state.allocated;
-    return state.allocated;
+    const int64_t now_ms = NowMillis();
+    if (state.last_commit_ms > 0 && snapshot_min_interval_ms_ > 0) {
+        const int64_t elapsed_ms = now_ms - state.last_commit_ms;
+        if (elapsed_ms < snapshot_min_interval_ms_) {
+            out_retry_after_ms = static_cast<uint64_t>(snapshot_min_interval_ms_ - elapsed_ms);
+            return EC_SNAPSHOT_RATE_LIMITED;
+        }
+    }
+    do {
+        out_candidate_version = GenerateSnapshotVersionToken();
+    } while (out_candidate_version == state.committed);
+    state.in_flight = out_candidate_version;
+    return EC_OK;
 }
 
-bool EventReportBackend::CommitSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version) {
-    if (version == 0) {
+bool EventReportBackend::CommitSnapshotVersion(const SnapshotScopeKey &scope, const std::string &version) {
+    if (!IsValidSnapshotVersionToken(version)) {
         return false;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto &state = snapshot_versions_[scope];
-    if (state.in_flight != version) {
+    auto it = snapshot_versions_.find(scope);
+    if (it == snapshot_versions_.end() || it->second.in_flight != version) {
         return false;
     }
-    state.allocated = std::max(state.allocated, version);
-    state.committed = std::max(state.committed, version);
-    state.in_flight = 0;
+    it->second.committed = version;
+    it->second.in_flight.clear();
+    it->second.last_commit_ms = NowMillis();
     return true;
 }
 
-void EventReportBackend::AbortSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version) {
-    if (version == 0 || scope.instance_id.empty() || scope.host_ip_port.empty() || scope.medium.empty()) {
+void EventReportBackend::AbortSnapshotVersion(const SnapshotScopeKey &scope, const std::string &version) {
+    if (!IsValidSnapshotVersionToken(version) || scope.instance_id.empty() || scope.host_ip_port.empty()) {
         return;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     auto it = snapshot_versions_.find(scope);
     if (it != snapshot_versions_.end() && it->second.in_flight == version) {
-        it->second.in_flight = 0;
+        it->second.in_flight.clear();
     }
 }
 
-void EventReportBackend::ObserveAllocatedSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version) {
-    if (version == 0 || scope.instance_id.empty() || scope.host_ip_port.empty() || scope.medium.empty()) {
-        return;
-    }
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto &state = snapshot_versions_[scope];
-    state.allocated = std::max(state.allocated, version);
-}
-
-void EventReportBackend::ObserveSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version) {
-    if (version == 0 || scope.instance_id.empty() || scope.host_ip_port.empty() || scope.medium.empty()) {
-        return;
-    }
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto &state = snapshot_versions_[scope];
-    state.allocated = std::max(state.allocated, version);
-    state.committed = std::max(state.committed, version);
-}
-
-uint64_t EventReportBackend::GetSnapshotVersion(const SnapshotScopeKey &scope) const {
+std::string EventReportBackend::GetSnapshotVersion(const SnapshotScopeKey &scope) const {
     std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
     auto it = snapshot_versions_.find(scope);
-    return it == snapshot_versions_.end() ? 0 : it->second.committed;
+    return it == snapshot_versions_.end() ? std::string{} : it->second.committed;
+}
+
+void EventReportBackend::SetSnapshotMinIntervalMsForTest(int64_t interval_ms) {
+    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    snapshot_min_interval_ms_ = std::max<int64_t>(0, interval_ms);
 }
 
 DataStorageType EventReportBackend::GetStorageType() const { return config_.type(); }

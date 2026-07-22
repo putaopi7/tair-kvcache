@@ -454,135 +454,185 @@ TEST_F(EventReportBackendTest, TwoInstancesSameHostIsolated) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
-TEST_F(EventReportBackendTest, SnapshotVersionLifecycleIsFencedPerScope) {
-    EventReportBackend backend(metrics_registry_);
-    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+TEST(EventReportBackendSnapshotTest, RequiresSnapshotBeforeAnyDelta) {
+    EventReportBackend backend(nullptr);
+    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
 
-    const SnapshotScopeKey mem_scope{"instance_a", "10.0.0.60:8080", "mem"};
-    const SnapshotScopeKey disk_scope{"instance_a", "10.0.0.60:8080", "disk"};
-    EXPECT_EQ(1u, backend.AllocateSnapshotVersion(mem_scope));
-    EXPECT_EQ(0u, backend.AllocateSnapshotVersion(mem_scope));
-    EXPECT_EQ(1u, backend.AllocateSnapshotVersion(disk_scope));
-    uint64_t delta_version = 0;
-    EXPECT_FALSE(backend.BeginDeltaMutation(mem_scope, delta_version));
+    std::string committed;
+    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(scope, committed));
+    EXPECT_TRUE(committed.empty());
+    EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
+}
 
-    EXPECT_FALSE(backend.CommitSnapshotVersion(mem_scope, 2));
-    EXPECT_TRUE(backend.CommitSnapshotVersion(mem_scope, 1));
-    EXPECT_EQ(1u, backend.GetSnapshotVersion(mem_scope));
-    EXPECT_TRUE(backend.CommitSnapshotVersion(disk_scope, 1));
-    EXPECT_TRUE(backend.BeginDeltaMutation(mem_scope, delta_version));
-    EXPECT_EQ(1u, delta_version);
-    EXPECT_TRUE(backend.BeginDeltaMutation(mem_scope, delta_version));
-    EXPECT_EQ(1u, delta_version);
-    EXPECT_EQ(0u, backend.AllocateSnapshotVersion(mem_scope));
-    backend.EndDeltaMutation(mem_scope);
-    EXPECT_EQ(0u, backend.AllocateSnapshotVersion(mem_scope));
-    backend.EndDeltaMutation(mem_scope);
+TEST(EventReportBackendSnapshotTest, SnapshotCommitPublishesOpaqueToken) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
 
-    EXPECT_EQ(2u, backend.AllocateSnapshotVersion(mem_scope));
-    backend.AbortSnapshotVersion(mem_scope, 2);
-    EXPECT_EQ(3u, backend.AllocateSnapshotVersion(mem_scope));
-    EXPECT_TRUE(backend.CommitSnapshotVersion(mem_scope, 3));
+    std::string candidate;
+    uint64_t retry_after_ms = 123;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, candidate, retry_after_ms));
+    EXPECT_EQ(0u, retry_after_ms);
+    EXPECT_TRUE(IsValidSnapshotVersionToken(candidate));
+    EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
 
-    const SnapshotScopeKey recovered_scope{"instance_b", "10.0.0.61:8080", "hbm"};
-    backend.ObserveSnapshotVersion(recovered_scope, 8);
-    EXPECT_EQ(8u, backend.GetSnapshotVersion(recovered_scope));
-    EXPECT_EQ(9u, backend.AllocateSnapshotVersion(recovered_scope));
-    EXPECT_TRUE(backend.CommitSnapshotVersion(recovered_scope, 9));
+    EXPECT_TRUE(backend.CommitSnapshotVersion(scope, candidate));
+    EXPECT_EQ(candidate, backend.GetSnapshotVersion(scope));
 
-    const SnapshotScopeKey failed_scope{"instance_b", "10.0.0.62:8080", "hbm"};
-    backend.ObserveAllocatedSnapshotVersion(failed_scope, 11);
-    EXPECT_EQ(0u, backend.GetSnapshotVersion(failed_scope));
-    EXPECT_EQ(12u, backend.AllocateSnapshotVersion(failed_scope));
-    backend.AbortSnapshotVersion(failed_scope, 12);
+    std::string committed;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(scope, committed));
+    EXPECT_EQ(candidate, committed);
+    backend.EndDeltaMutation(scope);
+}
+
+TEST(EventReportBackendSnapshotTest, SnapshotAndDeltaUseExplicitRetryableFences) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
+
+    std::string first;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, first, retry_after_ms));
+
+    std::string ignored;
+    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, backend.BeginDeltaMutation(scope, ignored));
+    std::string concurrent_snapshot;
+    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, backend.BeginSnapshot(scope, concurrent_snapshot, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(scope, first));
+
+    std::string committed1;
+    std::string committed2;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(scope, committed1));
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(scope, committed2));
+    EXPECT_EQ(first, committed1);
+    EXPECT_EQ(first, committed2);
+
+    std::string blocked_snapshot;
+    EXPECT_EQ(EC_DELTA_IN_PROGRESS, backend.BeginSnapshot(scope, blocked_snapshot, retry_after_ms));
+    backend.EndDeltaMutation(scope);
+    EXPECT_EQ(EC_DELTA_IN_PROGRESS, backend.BeginSnapshot(scope, blocked_snapshot, retry_after_ms));
+    backend.EndDeltaMutation(scope);
+    EXPECT_EQ(EC_OK, backend.BeginSnapshot(scope, blocked_snapshot, retry_after_ms));
+    backend.AbortSnapshotVersion(scope, blocked_snapshot);
+}
+
+TEST(EventReportBackendSnapshotTest, AbortNeverPublishesAndWrongTokenCannotCommit) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
+
+    std::string candidate;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, candidate, retry_after_ms));
+    EXPECT_FALSE(backend.CommitSnapshotVersion(scope, std::string(32, 'f')));
+    EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
+
+    backend.AbortSnapshotVersion(scope, std::string(32, 'e'));
+    std::string still_blocked;
+    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, backend.BeginSnapshot(scope, still_blocked, retry_after_ms));
+
+    backend.AbortSnapshotVersion(scope, candidate);
+    EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
+    EXPECT_EQ(EC_OK, backend.BeginSnapshot(scope, still_blocked, retry_after_ms));
+    backend.AbortSnapshotVersion(scope, still_blocked);
+}
+
+TEST(EventReportBackendSnapshotTest, SnapshotRateLimitReturnsRetryDelay) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(30'000);
+    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
+
+    std::string first;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, first, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(scope, first));
+
+    std::string second;
+    EXPECT_EQ(EC_SNAPSHOT_RATE_LIMITED, backend.BeginSnapshot(scope, second, retry_after_ms));
+    EXPECT_GT(retry_after_ms, 0u);
+    EXPECT_LE(retry_after_ms, 30'000u);
+    EXPECT_TRUE(second.empty());
+
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    EXPECT_EQ(EC_OK, backend.BeginSnapshot(scope, second, retry_after_ms));
+    backend.AbortSnapshotVersion(scope, second);
+}
+
+TEST(EventReportBackendSnapshotTest, ScopesAreIsolatedByInstanceAndReporterHost) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const SnapshotScopeKey scope_a{"instance-a", "10.0.0.1:8080"};
+    const SnapshotScopeKey scope_b{"instance-a", "10.0.0.2:8080"};
+    const SnapshotScopeKey scope_c{"instance-b", "10.0.0.1:8080"};
+
+    std::string token_a;
+    std::string token_b;
+    std::string token_c;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope_a, token_a, retry_after_ms));
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope_b, token_b, retry_after_ms));
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope_c, token_c, retry_after_ms));
+    EXPECT_NE(token_a, token_b);
+    EXPECT_NE(token_a, token_c);
+    EXPECT_NE(token_b, token_c);
+
+    EXPECT_TRUE(backend.CommitSnapshotVersion(scope_a, token_a));
+    EXPECT_TRUE(backend.CommitSnapshotVersion(scope_b, token_b));
+    EXPECT_TRUE(backend.CommitSnapshotVersion(scope_c, token_c));
+    EXPECT_EQ(token_a, backend.GetSnapshotVersion(scope_a));
+    EXPECT_EQ(token_b, backend.GetSnapshotVersion(scope_b));
+    EXPECT_EQ(token_c, backend.GetSnapshotVersion(scope_c));
+}
+
+TEST(EventReportBackendSnapshotTest, UnregisterForcesFullSnapshotAgain) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const std::string instance_id = "instance-a";
+    const std::string host = "10.0.0.1:8080";
+    const SnapshotScopeKey scope{instance_id, host};
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm", "dram"}));
+    std::string token;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, token, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(scope, token));
+    ASSERT_EQ(token, backend.GetSnapshotVersion(scope));
+
+    ASSERT_EQ(EC_OK, backend.UnregisterNode(instance_id, host));
+    EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
+    std::string committed;
+    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(scope, committed));
+}
+
+TEST(EventReportBackendSnapshotTest, StableLocationIdHasNoSnapshotGeneration) {
+    EventReportBackend backend(nullptr);
+    const std::string location_id = backend.BuildLocationId("hbm", "10.0.0.1:8080");
+    EXPECT_EQ("kvs#event_report#hbm#10.0.0.1:8080", location_id);
 
     std::string medium;
     std::string host;
-    EXPECT_TRUE(backend.ParseLocationId(backend.BuildLocationId("hbm", "10.0.0.61:8080"), medium, host));
+    EXPECT_TRUE(backend.ParseLocationId(location_id, medium, host));
     EXPECT_EQ("hbm", medium);
-    EXPECT_EQ("10.0.0.61:8080", host);
-    EXPECT_TRUE(backend.ParseLocationId(backend.BuildSnapshotLocationId("hbm", "10.0.0.61:8080", 8), medium, host));
-    EXPECT_EQ("hbm", medium);
-    EXPECT_EQ("10.0.0.61:8080", host);
-    EXPECT_FALSE(backend.ParseLocationId("kvs#event_report#hbm#snapshot_v=bad#10.0.0.61:8080", medium, host));
-    EXPECT_FALSE(backend.ParseLocationId("kvs#event_report#hbm", medium, host));
-
-    ASSERT_EQ(EC_OK, backend.Close());
+    EXPECT_EQ("10.0.0.1:8080", host);
+    EXPECT_FALSE(backend.ParseLocationId("kvs#event_report#hbm#snapshot_v=7#10.0.0.1:8080", medium, host));
 }
 
-TEST_F(EventReportBackendTest, SnapshotVersionMetadataKeyRoundTripsUnambiguousScope) {
-    const SnapshotScopeKey scope{"instance_a", "[2001:db8::1]:8080", "gpu#hbm"};
-    const std::string key = SnapshotVersionMetadataKey(scope);
-    EXPECT_TRUE(IsSnapshotVersionMetadataKey(key));
+TEST(EventReportBackendSnapshotTest, UriCarriesOnlyOpaqueSnapshotToken) {
+    const std::string token = "00112233445566778899aabbccddeeff";
+    const std::string reporter_uri = "vineyard://127.0.0.1:9600/object?size=1024";
+    std::string versioned_uri;
+    ASSERT_TRUE(AddSnapshotVersionToUri(reporter_uri, token, versioned_uri));
+    EXPECT_NE(std::string::npos, versioned_uri.find("s_version=" + token));
+    EXPECT_EQ(std::string::npos, versioned_uri.find("kvcm_"));
 
-    SnapshotScopeKey parsed;
-    ASSERT_TRUE(ParseSnapshotVersionMetadataKey(scope.instance_id, key, parsed));
-    EXPECT_TRUE(scope == parsed);
-    const std::string allocated_key = SnapshotAllocatedVersionMetadataKey(scope);
-    ASSERT_TRUE(ParseSnapshotAllocatedVersionMetadataKey(scope.instance_id, allocated_key, parsed));
-    EXPECT_TRUE(scope == parsed);
-    EXPECT_FALSE(ParseSnapshotVersionMetadataKey(scope.instance_id, "__event_snapshot_version__#bad", parsed));
-    EXPECT_FALSE(ParseSnapshotVersionMetadataKey("", key, parsed));
-}
+    SnapshotUriInfo info;
+    ASSERT_TRUE(ParseSnapshotUriInfo(versioned_uri, info));
+    EXPECT_EQ(token, info.version);
+    EXPECT_TRUE(HasEventReportInternalUriMetadata(DataStorageUri(versioned_uri)));
 
-TEST_F(EventReportBackendTest, MightExistRequiresCommittedVersionAndAuthoritativeReporterHost) {
-    EventReportBackend backend(metrics_registry_);
-    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
-
-    const SnapshotScopeKey scope{"instance_a", "10.0.0.70:8080", "mem"};
-    ASSERT_EQ(EC_OK, backend.RegisterNode(scope.instance_id, scope.host_ip_port, {scope.medium}));
-
-    std::string scoped_incremental_uri;
-    ASSERT_TRUE(AddEventReportScopeToUri(
-        "event_report://physical-storage.example:9600/cache/1", scope, scoped_incremental_uri));
-    EXPECT_EQ(std::vector<bool>({true}), backend.MightExist({DataStorageUri(scoped_incremental_uri)}));
-    const SnapshotScopeKey unregistered_scope{"instance_b", scope.host_ip_port, scope.medium};
-    std::string unregistered_incremental_uri;
-    ASSERT_TRUE(AddEventReportScopeToUri(
-        "event_report://physical-storage.example:9600/cache/1", unregistered_scope, unregistered_incremental_uri));
-    EXPECT_EQ(std::vector<bool>({false}), backend.MightExist({DataStorageUri(unregistered_incremental_uri)}));
-    EXPECT_EQ(std::vector<bool>({false}),
-              backend.MightExist({DataStorageUri(
-                  "event_report://physical-storage.example:9600/cache/1?kvcm_instance_id=instance_a")}));
-
-    const uint64_t version1 = backend.AllocateSnapshotVersion(scope);
-    EXPECT_TRUE(HasEventReportInternalUriMetadata(
-        DataStorageUri("event_report://physical-storage.example:9600/cache/1?kvcm_future=")));
-    EXPECT_EQ(
-        std::vector<bool>({false}),
-        backend.MightExist({DataStorageUri("event_report://physical-storage.example:9600/cache/1?kvcm_future=")}));
-    EXPECT_EQ(std::vector<bool>({false}),
-              backend.MightExist({DataStorageUri(
-                  "event_report://physical-storage.example:9600/cache/1?kvcm_host_ip_port=10.0.0.70:8080&"
-                  "kvcm_instance_id=instance_a&kvcm_medium=mem&kvcm_snapshot_version=")}));
-    ASSERT_EQ(1u, version1);
-
-    std::string uri1;
-    ASSERT_TRUE(AddSnapshotVersionToUri("event_report://physical-storage.example:9600/cache/1", scope, version1, uri1));
-    EXPECT_EQ(std::vector<bool>({false}), backend.MightExist({DataStorageUri(uri1)}));
-    ASSERT_TRUE(backend.CommitSnapshotVersion(scope, version1));
-    EXPECT_EQ(std::vector<bool>({true}), backend.MightExist({DataStorageUri(uri1)}));
-
-    const uint64_t version2 = backend.AllocateSnapshotVersion(scope);
-    std::string uri2;
-    ASSERT_TRUE(AddSnapshotVersionToUri("event_report://physical-storage.example:9600/cache/1", scope, version2, uri2));
-    EXPECT_EQ(std::vector<bool>({false}), backend.MightExist({DataStorageUri(uri2)}));
-    EXPECT_EQ(std::vector<bool>({true}), backend.MightExist({DataStorageUri(uri1)}));
-    ASSERT_TRUE(backend.CommitSnapshotVersion(scope, version2));
-    EXPECT_EQ(std::vector<bool>({false}), backend.MightExist({DataStorageUri(uri1)}));
-    EXPECT_EQ(std::vector<bool>({true}), backend.MightExist({DataStorageUri(uri2)}));
-
-    SnapshotUriInfo parsed;
-    ASSERT_TRUE(ParseSnapshotUriInfo(uri2, parsed));
-    EXPECT_TRUE(scope == parsed.scope);
-    EXPECT_EQ(version2, parsed.version);
-
-    const SnapshotScopeKey other_instance{"instance_b", scope.host_ip_port, scope.medium};
-    backend.ObserveSnapshotVersion(other_instance, version2);
-    std::string other_uri;
-    ASSERT_TRUE(AddSnapshotVersionToUri(
-        "event_report://physical-storage.example:9600/cache/1", other_instance, version2, other_uri));
-    EXPECT_EQ(std::vector<bool>({false}), backend.MightExist({DataStorageUri(other_uri)}));
-
-    ASSERT_EQ(EC_OK, backend.Close());
+    EXPECT_FALSE(ParseSnapshotUriInfo(versioned_uri + "&s_version=" + token, info));
+    EXPECT_FALSE(AddSnapshotVersionToUri(versioned_uri, token, versioned_uri));
+    EXPECT_FALSE(IsValidSnapshotVersionToken(""));
+    EXPECT_FALSE(IsValidSnapshotVersionToken("7"));
+    EXPECT_FALSE(IsValidSnapshotVersionToken(std::string(32, 'g')));
 }

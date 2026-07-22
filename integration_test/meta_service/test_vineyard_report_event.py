@@ -179,24 +179,16 @@ def _ev_block_delete(block_key, medium, spec_names):
 
 
 def _ev_block_snapshot(medium, blocks):
-    """Build an authoritative snapshot for one reporter host/medium scope.
-
-    Args:
-        blocks: list of {"block_key": ..., "specs": [...]} dicts. The list and
-            every specs list must be complete, not a page or delta.
-    """
+    """Build one authoritative snapshot; medium is a block-level attribute."""
+    snapshot_blocks = []
+    for block in blocks:
+        item = dict(block)
+        item["block_key"] = str(item["block_key"])
+        item["medium"] = medium
+        snapshot_blocks.append(item)
     return {
         "event_type": "EVENT_BLOCK_SNAPSHOT",
-        "block_snapshot": {
-            "medium": medium,
-            "blocks": [
-                {
-                    "block_key": str(block["block_key"]),
-                    "specs": list(block["specs"]),
-                }
-                for block in blocks
-            ],
-        },
+        "block_snapshot": {"blocks": snapshot_blocks},
     }
 
 
@@ -251,37 +243,43 @@ def _query_block_specs(client, instance_id, block_key, trace_id):
     ]
 
 
-def _assert_reporter_scope(test_case, actual_uri, reported_uri, instance_id, host, medium, version=None):
-    """Assert internal scope metadata without hiding changes to user URI data."""
+def _assert_reporter_scope(
+    test_case, actual_uri, reported_uri, instance_id, host, medium, version=None
+):
+    """Assert the reporter URI is preserved except for the opaque s_version."""
     actual = urlsplit(actual_uri)
     reported = urlsplit(reported_uri)
-    actual_params = dict(parse_qsl(actual.query, keep_blank_values=True))
-    reported_params = dict(parse_qsl(reported.query, keep_blank_values=True))
-
-    test_case.assertEqual(
-        (reported.scheme, reported.netloc, reported.path),
-        (actual.scheme, actual.netloc, actual.path),
-    )
-    test_case.assertEqual(instance_id, actual_params.pop("kvcm_instance_id", None))
-    test_case.assertEqual(host, actual_params.pop("kvcm_host_ip_port", None))
-    test_case.assertEqual(medium, actual_params.pop("kvcm_medium", None))
-    actual_version = actual_params.pop("kvcm_snapshot_version", None)
+    test_case.assertEqual(actual.scheme, reported.scheme)
+    test_case.assertEqual(actual.netloc, reported.netloc)
+    test_case.assertEqual(actual.path, reported.path)
+    actual_params = parse_qsl(actual.query, keep_blank_values=True)
+    reported_params = parse_qsl(reported.query, keep_blank_values=True)
+    visible_params = [(k, v) for k, v in actual_params if k != "s_version"]
+    test_case.assertEqual(visible_params, reported_params)
+    test_case.assertFalse(any(k.startswith("kvcm_") for k, _ in actual_params))
+    versions = [v for k, v in actual_params if k == "s_version"]
     if version is None:
-        test_case.assertIsNone(actual_version)
+        test_case.assertEqual(len(versions), 1)
+        test_case.assertEqual(len(versions[0]), 32)
+        test_case.assertTrue(
+            all(c in "0123456789abcdef" for c in versions[0])
+        )
     else:
-        test_case.assertEqual(str(version), actual_version)
-    test_case.assertEqual(reported_params, actual_params)
+        test_case.assertEqual(versions, [version])
 
 
 def _snapshot_version_from_uri(test_case, uri):
-    params = dict(parse_qsl(urlsplit(uri).query, keep_blank_values=True))
-    raw_version = params.get("kvcm_snapshot_version")
-    test_case.assertIsNotNone(raw_version)
-    try:
-        version = int(raw_version)
-    except (TypeError, ValueError):
-        test_case.fail(f"invalid kvcm_snapshot_version in URI: {uri}")
-    test_case.assertGreater(version, 0)
+    values = [
+        value
+        for key, value in parse_qsl(
+            urlsplit(uri).query, keep_blank_values=True
+        )
+        if key == "s_version"
+    ]
+    test_case.assertEqual(len(values), 1, "URI must contain one s_version")
+    version = values[0]
+    test_case.assertEqual(len(version), 32)
+    test_case.assertTrue(all(c in "0123456789abcdef" for c in version))
     return version
 
 
@@ -321,6 +319,14 @@ class EventReportFunctionalTest(unittest.TestCase):
                 cls.HOST,
                 [_ev_node_register(["mem", "disk"])],
                 trace_id="setup_register_host",
+            )
+        )
+        cls.client.report_event(
+            _make_request(
+                cls.instance_id,
+                cls.HOST,
+                [_ev_block_snapshot("mem", [])],
+                "setup_initial_snapshot",
             )
         )
 
@@ -503,6 +509,13 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(self.instance_id, host, [_ev_node_register(["mem", "disk"])], trace_id="t05a")
         )
+        self.client.report_event(
+            _make_request(
+                self.instance_id, host,
+                [_ev_block_snapshot("mem", [])],
+                trace_id="t05_initial_snapshot",
+            )
+        )
         uri_mem = _build_event_report_uri(host, "mem")
         uri_disk = _build_event_report_uri(host, "disk")
         body = self.client.report_event(
@@ -546,6 +559,13 @@ class EventReportFunctionalTest(unittest.TestCase):
         host = "192.168.1.221:8080"
         self.client.report_event(
             _make_request(self.instance_id, host, [_ev_node_register(["mem"])], trace_id="t05b_reg")
+        )
+        self.client.report_event(
+            _make_request(
+                self.instance_id, host,
+                [_ev_block_snapshot("mem", [])],
+                trace_id="t05b_initial_snapshot",
+            )
         )
         uri_spec0 = _build_event_report_uri(host, "mem", {"obj_id": "o1", "size": "512"})
         uri_spec1 = _build_event_report_uri(host, "mem", {"obj_id": "o2", "size": "512"})
@@ -642,7 +662,19 @@ class EventReportFunctionalTest(unittest.TestCase):
                         _build_event_report_uri(
                             down_host,
                             "disk"))))
-        self.client.report_event(_make_request(self.instance_id, down_host, events, trace_id="t08a"))
+        self.client.report_event(
+            _make_request(self.instance_id, down_host, events[:1], trace_id="t08_register")
+        )
+        self.client.report_event(
+            _make_request(
+                self.instance_id, down_host,
+                [_ev_block_snapshot("mem", [])],
+                trace_id="t08_initial_snapshot",
+            )
+        )
+        self.client.report_event(
+            _make_request(self.instance_id, down_host, events[1:], trace_id="t08a")
+        )
 
         body = self.client.report_event(
             _make_request(self.instance_id, down_host, [_ev_host_down()], trace_id="t08b")
@@ -684,8 +716,18 @@ class EventReportFunctionalTest(unittest.TestCase):
             _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_event_report_uri(host, "mem"))),
             _ev_heartbeat({"phase": "boot"}),
         ]
+        self.client.report_event(
+            _make_request(self.instance_id, host, events[:1], trace_id="t11_register")
+        )
+        self.client.report_event(
+            _make_request(
+                self.instance_id, host,
+                [_ev_block_snapshot("mem", [])],
+                trace_id="t11_initial_snapshot",
+            )
+        )
         body = self.client.report_event(
-            _make_request(self.instance_id, host, events, trace_id="t11")
+            _make_request(self.instance_id, host, events[1:], trace_id="t11")
         )
         self.assertIn("header", body)
 
@@ -901,10 +943,17 @@ class EventReportFunctionalTest(unittest.TestCase):
                     _ev_block_add(key, "mem", _make_single_spec("tp0", uri))
                 )
             self.client.report_event(
+                _make_request(self.instance_id, host, events[:1], trace_id="t16_register")
+            )
+            self.client.report_event(
                 _make_request(
-                    instance_id, host, events,
-                    trace_id=f"t16_setup_{host}",
+                    instance_id, host,
+                    [_ev_block_snapshot("mem", [])],
+                    trace_id="t16_initial_snapshot",
                 )
+            )
+            self.client.report_event(
+                _make_request(instance_id, host, events[1:], trace_id="t16_setup_delta")
             )
 
         # 2. Query GetHostCacheState
@@ -935,252 +984,164 @@ class EventReportFunctionalTest(unittest.TestCase):
     # 17. Snapshot is a complete reconciliation barrier and supports empty clear.
     def test_17_snapshot_reconciliation_contract(self):
         host = "192.168.1.240:8080"
-        physical_host = "10.10.10.10:9600"
-        self.client.report_event(
+        register = self.client.report_event(
             _make_request(
                 self.instance_id,
                 host,
-                [_ev_node_register(["mem"])],
+                [_ev_node_register(["mem", "disk"])],
                 trace_id="t17_register",
             )
         )
+        self.assertTrue(register.get("snapshot_required"))
 
-        snapshot = _ev_block_snapshot("mem", [
+        mem_uri = _build_event_report_uri(host, "mem", {"user": "mem"})
+        disk_uri = _build_event_report_uri(host, "disk", {"user": "disk"})
+        blocks = [
             {
-                "block_key": 9301,
-                "specs": [
-                    {"name": "linear_0", "uri": _build_event_report_uri(physical_host, "mem")},
-                    {"name": "full_3", "uri": _build_event_report_uri(physical_host, "mem")},
-                ],
+                "block_key": "9170",
+                "medium": "mem",
+                "specs": _make_single_spec("linear_0", mem_uri),
             },
             {
-                "block_key": 9302,
-                "specs": _make_single_spec(
-                    "linear_0", _build_event_report_uri(physical_host, "mem")
-                ),
+                "block_key": "9171",
+                "medium": "disk",
+                "specs": _make_single_spec("full_3", disk_uri),
             },
-        ])
-        self.client.report_event(
-            _make_request(self.instance_id, host, [snapshot], trace_id="t17_snapshot")
-        )
-
-        resp = self.client.get_cache_location({
-            "trace_id": "t17_query",
-            "instance_id": self.instance_id,
-            "query_type": "QT_BATCH_GET",
-            "block_keys": [9301],
-            "block_mask": {"offset": 0},
-        })
-        specs = resp.get("locations", [{}])[0].get("location_specs", [])
-        self.assertEqual({"linear_0", "full_3"}, {spec.get("name") for spec in specs})
-        for spec in specs:
-            uri = spec.get("uri", "")
-            self.assertIn("kvcm_snapshot_version=", uri)
-            self.assertIn("kvcm_host_ip_port=", uri)
-        initial_versions = {
-            _snapshot_version_from_uri(self, spec.get("uri", "")) for spec in specs
-        }
-        self.assertEqual(1, len(initial_versions))
-        initial_version = next(iter(initial_versions))
-
-        # A second complete snapshot replaces both omitted blocks and omitted
-        # specs, then later deltas continue on the committed version.
-        replacement_uri = _build_event_report_uri(
-            physical_host, "mem", {"epoch": "replacement"}
-        )
-        self.client.report_event(
+        ]
+        response = self.client.report_event(
             _make_request(
                 self.instance_id,
                 host,
-                [_ev_block_snapshot("mem", [{
-                    "block_key": 9301,
-                    "specs": [{"name": "linear_0", "uri": replacement_uri}],
-                }])],
-                trace_id="t17_replacement_snapshot",
+                [{
+                    "event_type": "EVENT_BLOCK_SNAPSHOT",
+                    "block_snapshot": {"blocks": blocks},
+                }],
+                trace_id="t17_multi_medium_snapshot",
             )
         )
-        specs = _wait_for_block_spec_names(
-            self.client, self.instance_id, 9301, {"linear_0"}, "t17_replacement_query"
-        )
-        replacement_version = _snapshot_version_from_uri(self, specs[0].get("uri", ""))
-        self.assertEqual(initial_version + 1, replacement_version)
-        _assert_reporter_scope(
-            self,
-            specs[0].get("uri", ""),
-            replacement_uri,
-            self.instance_id,
-            host,
-            "mem",
-            replacement_version,
-        )
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9302, set(), "t17_omitted_block_query"
-        )
+        self.assertFalse(response.get("snapshot_required"))
+        version = response.get("committed_snapshot_version", "")
+        self.assertEqual(len(version), 32)
+        self.assertTrue(all(c in "0123456789abcdef" for c in version))
 
+        for block_key, spec_name, reported_uri in (
+            ("9170", "linear_0", mem_uri),
+            ("9171", "full_3", disk_uri),
+        ):
+            specs = _wait_for_block_spec_names(
+                self.client,
+                self.instance_id,
+                block_key,
+                {spec_name},
+                "t17_query_" + block_key,
+            )
+            self.assertEqual(len(specs), 1)
+            actual_uri = specs[0].get("uri", "")
+            self.assertEqual(_snapshot_version_from_uri(self, actual_uri), version)
+            _assert_reporter_scope(
+                self, actual_uri, reported_uri,
+                self.instance_id, host, "", version,
+            )
+
+        delta_uri = _build_event_report_uri(host, "mem", {"user": "delta"})
         self.client.report_event(
             _make_request(
                 self.instance_id,
                 host,
                 [_ev_block_add(
-                    9301,
+                    "9172",
                     "mem",
-                    _make_single_spec("full_3", _build_event_report_uri(physical_host, "mem")),
+                    _make_single_spec("linear_0", delta_uri),
                 )],
-                trace_id="t17_post_snapshot_add",
+                trace_id="t17_delta_after_snapshot",
             )
         )
-        specs = _wait_for_block_spec_names(
-            self.client, self.instance_id, 9301, {"linear_0", "full_3"}, "t17_add_query"
+        delta_specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            "9172",
+            {"linear_0"},
+            "t17_delta_query",
         )
-        for spec in specs:
-            self.assertEqual(
-                replacement_version,
-                _snapshot_version_from_uri(self, spec.get("uri", "")),
-            )
-
-        self.client.report_event(
-            _make_request(
-                self.instance_id,
-                host,
-                [_ev_block_delete(9301, "mem", ["linear_0"])],
-                trace_id="t17_post_snapshot_delete",
-            )
-        )
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9301, {"full_3"}, "t17_delete_query"
-        )
-
-        # Snapshot and delta mutations must be separate ordered requests.
-        mixed = self.client.report_event(
-            _make_request(
-                self.instance_id,
-                host,
-                [
-                    _ev_block_snapshot("mem", []),
-                    _ev_block_add(
-                        9303,
-                        "mem",
-                        _make_single_spec("linear_0", _build_event_report_uri(physical_host, "mem")),
-                    ),
-                ],
-                trace_id="t17_mixed_rejected",
-            ),
-            check_ok=False,
-        )
-        mixed_code = mixed.get("header", {}).get("status", {}).get("code")
-        self.assertNotIn(mixed_code, ("OK", 1, "1", None))
-
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9301, {"full_3"}, "t17_mixed_no_mutation_query"
-        )
-
-        # Empty snapshot authoritatively clears this reporter scope.
-        self.client.report_event(
-            _make_request(
-                self.instance_id,
-                host,
-                [_ev_block_snapshot("mem", [])],
-                trace_id="t17_empty_snapshot",
-            )
-        )
-
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9301, set(), "t17_empty_clear_query"
-        )
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9302, set(), "t17_empty_clear_omitted_query"
+        self.assertEqual(
+            _snapshot_version_from_uri(self, delta_specs[0]["uri"]),
+            version,
         )
 
     # 18. Snapshot scope is exactly (instance, reporter host, medium).
     def test_18_snapshot_scope_isolation(self):
         host_a = "192.168.1.241:8080"
         host_b = "192.168.1.242:8080"
-        physical_host = "10.10.10.11:9600"
-        self.client.report_event(
-            _make_request(
-                self.instance_id,
-                host_a,
-                [_ev_node_register(["mem", "disk"])],
-                trace_id="t18_register_a",
+        versions = {}
+        for host in (host_a, host_b):
+            self.client.report_event(
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_node_register(["mem", "disk"])],
+                    trace_id="t18_register_" + host,
+                )
             )
-        )
-        self.client.report_event(
-            _make_request(
-                self.instance_id,
-                host_b,
-                [_ev_node_register(["mem"])],
-                trace_id="t18_register_b",
+            response = self.client.report_event(
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_block_snapshot("mem", [])],
+                    trace_id="t18_snapshot_" + host,
+                )
             )
-        )
+            versions[host] = response["committed_snapshot_version"]
+            self.assertFalse(response.get("snapshot_required"))
 
-        # Two mediums in one request are independent snapshot transactions.
-        self.client.report_event(
-            _make_request(
-                self.instance_id,
-                host_a,
-                [
-                    _ev_block_snapshot("mem", [{
-                        "block_key": 9401,
-                        "specs": _make_single_spec(
-                            "linear_0", _build_event_report_uri(physical_host, "mem")
-                        ),
-                    }]),
-                    _ev_block_snapshot("disk", [{
-                        "block_key": 9402,
-                        "specs": _make_single_spec(
-                            "linear_0", _build_event_report_uri(physical_host, "disk")
-                        ),
-                    }]),
-                ],
-                trace_id="t18_host_a_snapshots",
-            )
-        )
-        self.client.report_event(
-            _make_request(
-                self.instance_id,
-                host_b,
-                [_ev_block_snapshot("mem", [{
-                    "block_key": 9403,
-                    "specs": _make_single_spec(
-                        "linear_0", _build_event_report_uri(physical_host, "mem")
-                    ),
-                }])],
-                trace_id="t18_host_b_snapshot",
-            )
-        )
-
-        for block_key in (9401, 9402, 9403):
-            specs = _wait_for_block_spec_names(
-                self.client, self.instance_id, block_key, {"linear_0"}, f"t18_query_{block_key}"
-            )
-            self.assertEqual(1, len(specs))
-            self.assertGreater(
-                _snapshot_version_from_uri(self, specs[0].get("uri", "")), 0
-            )
-
-        # Clearing host A's mem scope cannot affect host A/disk or host B/mem.
-        self.client.report_event(
+        self.assertNotEqual(versions[host_a], versions[host_b])
+        limited = self.client.report_event(
             _make_request(
                 self.instance_id,
                 host_a,
                 [_ev_block_snapshot("mem", [])],
-                trace_id="t18_clear_host_a_mem",
+                trace_id="t18_rate_limited",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            limited["header"]["status"]["code"],
+            "SNAPSHOT_RATE_LIMITED",
+        )
+        self.assertGreater(int(limited.get("retry_after_ms", 0)), 0)
+        self.assertEqual(
+            limited.get("committed_snapshot_version"),
+            versions[host_a],
+        )
+
+        uri_b = _build_event_report_uri(host_b, "disk")
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host_b,
+                [_ev_block_add(
+                    "9180",
+                    "disk",
+                    _make_single_spec("full_3", uri_b),
+                )],
+                trace_id="t18_host_b_delta",
             )
         )
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9401, set(), "t18_query_cleared_mem"
+        specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            "9180",
+            {"full_3"},
+            "t18_host_b_query",
         )
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9402, {"linear_0"}, "t18_query_host_a_disk"
-        )
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9403, {"linear_0"}, "t18_query_host_b_mem"
+        self.assertEqual(
+            _snapshot_version_from_uri(self, specs[0]["uri"]),
+            versions[host_b],
         )
 
     # 19. Invalid complete sets fail before publishing any snapshot.
     def test_19_snapshot_validation_has_no_side_effects(self):
         host = "192.168.1.243:8080"
-        self.client.report_event(
+        register = self.client.report_event(
             _make_request(
                 self.instance_id,
                 host,
@@ -1188,56 +1149,91 @@ class EventReportFunctionalTest(unittest.TestCase):
                 trace_id="t19_register",
             )
         )
+        self.assertTrue(register.get("snapshot_required"))
 
-        invalid_requests = [
-            _ev_block_snapshot("mem", [{
-                "block_key": 9501,
-                "specs": _make_single_spec(
-                    "linear_0",
-                    _build_event_report_uri(host, "mem", {"kvcm_snapshot_version": "99"}),
-                ),
-            }]),
-            _ev_block_snapshot("mem", [{
-                "block_key": 9503,
-                "specs": _make_single_spec(
-                    "linear_0",
-                    _build_event_report_uri(host, "mem", {"kvcm_snapshot_version": ""}),
-                ),
-            }]),
-            _ev_block_snapshot("mem", [{
-                "block_key": 9504,
-                "specs": _make_single_spec(
-                    "linear_0",
-                    _build_event_report_uri(host, "mem", {"kvcm_future_internal": "client_value"}),
-                ),
-            }]),
-            _ev_block_snapshot("mem", [
-                {"block_key": 9502, "specs": _make_single_spec(
-                    "linear_0", _build_event_report_uri(host, "mem"))},
-                {"block_key": 9502, "specs": _make_single_spec(
-                    "linear_0", _build_event_report_uri(host, "mem"))},
-            ]),
-        ]
-        for index, snapshot in enumerate(invalid_requests):
-            body = self.client.report_event(
-                _make_request(self.instance_id, host, [snapshot], trace_id=f"t19_invalid_{index}"),
-                check_ok=False,
+        delta = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_add(
+                    "9190",
+                    "mem",
+                    _make_single_spec(
+                        "linear_0", _build_event_report_uri(host, "mem")
+                    ),
+                )],
+                trace_id="t19_delta_before_snapshot",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            delta["header"]["status"]["code"],
+            "SNAPSHOT_REQUIRED",
+        )
+
+        duplicate = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [{
+                    "event_type": "EVENT_BLOCK_SNAPSHOT",
+                    "block_snapshot": {"blocks": [
+                        {"block_key": "9191", "medium": "mem", "specs": []},
+                        {"block_key": "9191", "medium": "disk", "specs": []},
+                    ]},
+                }],
+                trace_id="t19_duplicate_blocks",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            duplicate["header"]["status"]["code"],
+            "INVALID_ARGUMENT",
+        )
+        self.assertEqual(duplicate.get("committed_snapshot_version", ""), "")
+        self.assertTrue(duplicate.get("snapshot_required"))
+
+        committed = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_snapshot("mem", [])],
+                trace_id="t19_empty_snapshot",
             )
-            code = body.get("header", {}).get("status", {}).get("code")
-            self.assertNotIn(code, ("OK", 1, "1", None))
+        )
+        self.assertEqual(len(committed["committed_snapshot_version"]), 32)
+        self.assertFalse(committed.get("snapshot_required"))
 
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9501, set(), "t19_reserved_param_no_write"
+        bad_host = "192.168.1.244:8080"
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                bad_host,
+                [_ev_node_register(["mem"])],
+                trace_id="t19_bad_uri_register",
+            )
         )
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9502, set(), "t19_duplicate_block_no_write"
+        bad_uri = _build_event_report_uri(
+            bad_host, "mem", {"s_version": "client_value"}
         )
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9503, set(), "t19_empty_reserved_param_no_write"
+        malformed = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                bad_host,
+                [_ev_block_snapshot("mem", [{
+                    "block_key": "9192",
+                    "specs": _make_single_spec("linear_0", bad_uri),
+                }])],
+                trace_id="t19_reserved_s_version",
+            ),
+            check_ok=False,
         )
-        _wait_for_block_spec_names(
-            self.client, self.instance_id, 9504, set(), "t19_future_reserved_param_no_write"
+        self.assertEqual(
+            malformed["header"]["status"]["code"],
+            "INVALID_ARGUMENT",
         )
+        self.assertEqual(malformed.get("committed_snapshot_version", ""), "")
+        self.assertTrue(malformed.get("snapshot_required"))
 
 # ---------------------------------------------------------------------------
 # Bench tests

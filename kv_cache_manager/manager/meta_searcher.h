@@ -95,9 +95,8 @@ public:
         CacheLocationStatus status;
         std::vector<LocationSpec> specs;
     };
-    // The create and replace phases are idempotent but not transactional across
-    // keys. Callers that need atomic visibility must publish through an external
-    // generation commit marker after this method succeeds.
+    // Replaces existing specs or creates the stable location in one metadata
+    // read-modify-write operation per batch.
     ErrorCode BatchReplaceLocationSpecs(RequestContext *request_context,
                                         const KeyVector &keys,
                                         const std::vector<std::vector<ReplaceLocationSpecsTask>> &tasks_per_key,
@@ -167,11 +166,6 @@ public:
                                      size_t scan_batch_size = 1000,
                                      std::function<bool()> should_abort = nullptr);
     bool Sync(const KeyVector &keys) noexcept;
-    ErrorCode PersistSnapshotAllocatedVersion(const SnapshotScopeKey &scope, uint64_t version) noexcept;
-    ErrorCode PersistSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version) noexcept;
-    using SnapshotVersionVisitor =
-        std::function<void(const SnapshotScopeKey &scope, uint64_t allocated_version, uint64_t committed_version)>;
-    ErrorCode VisitSnapshotVersions(const std::string &instance_id, SnapshotVersionVisitor visitor) noexcept;
 
 private:
     struct StorageTypeWeights {

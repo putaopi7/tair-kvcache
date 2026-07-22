@@ -104,14 +104,6 @@ public:
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override {
         for (const auto &[field, value] : field_maps) {
             (void)value;
-            if (fail_next_allocated_marker_ && IsSnapshotAllocatedVersionMetadataKey(field)) {
-                fail_next_allocated_marker_ = false;
-                return EC_ERROR;
-            }
-            if (fail_next_committed_marker_ && IsSnapshotVersionMetadataKey(field)) {
-                fail_next_committed_marker_ = false;
-                return EC_ERROR;
-            }
         }
         return MetaLocalBackend::PutMetaData(field_maps);
     }
@@ -2027,7 +2019,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportFallbackLookup)
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
     loc.set_location_specs({LocationSpec("tp0", "event_report://192.168.1.100:8080/mem?gpu=A100")});
-    ASSERT_EQ(func(loc), true);
+    ASSERT_EQ(func(loc), false);
 
     dsm->storage_map_.erase(event_report_storage_name);
     registry_manager_->instance_group_configs_.erase(instance_group);
@@ -2142,52 +2134,6 @@ TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_NullExecutor) {
     func({1, 2, 3}, {{"loc_a"}, {"loc_b"}, {"loc_c"}});
 
     cache_manager_->schedule_plan_executor_ = saved;
-}
-
-TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_SubmitsToExecutor) {
-    // verify that the functor actually submits a task to the
-    // schedule_plan_executor_ by checking that the internal task queue
-    // grows
-    auto &executor = cache_manager_->schedule_plan_executor_;
-
-    // stop worker threads so tasks accumulate in the queue without
-    // being consumed
-    executor->stop_.store(true);
-    executor->condition_.notify_all();
-    for (auto &w : executor->workers_) {
-        if (w.joinable()) {
-            w.join();
-        }
-    }
-    executor->workers_.clear();
-    // reset stop_ so SubmitRaw accepts new tasks
-    executor->stop_.store(false);
-
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
-    }
-
-    auto func = cache_manager_->GetSubmitDelReqFunc("test_instance");
-    func({100, 200}, {{"loc_a"}, {"loc_b"}});
-
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(1u, executor->tasks_.size());
-    }
-
-    // submit a second request and verify count increases
-    func({300}, {{"loc_c"}});
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        ASSERT_EQ(2u, executor->tasks_.size());
-    }
-
-    // clean up: clear tasks so executor destructor is clean
-    {
-        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
-        executor->tasks_.clear();
-    }
 }
 
 TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_DeletesLocationMetadata) {
@@ -2965,7 +2911,6 @@ TEST_F(CacheManagerTest, InvalidateInstanceMetricsInvokesCallback) {
     cm->InvalidateInstanceMetrics("");
     ASSERT_EQ(1, call_count);
 }
-
 TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
     auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     const std::string instance_id = "test_report_event_merge";

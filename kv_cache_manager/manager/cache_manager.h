@@ -1,11 +1,9 @@
 #pragma once
 
 #include <atomic>
-#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -267,17 +265,9 @@ private:
                               uint64_t cleanup_generation,
                               DataStorageType storage_type);
     ErrorCode CleanupStaleSnapshotLocations(const SnapshotScopeKey &scope,
-                                            uint64_t snapshot_version,
+                                            const std::string &snapshot_version,
                                             DataStorageType storage_type,
                                             const std::shared_ptr<EventReportBackend> &event_backend);
-    void ScheduleStaleSnapshotCleanup(const SnapshotScopeKey &scope,
-                                      uint64_t snapshot_version,
-                                      DataStorageType storage_type,
-                                      std::shared_ptr<EventReportBackend> event_backend);
-    void RunStaleSnapshotCleanup(const SnapshotScopeKey &scope);
-    ErrorCode RecoverEventSnapshotVersions(RequestContext *request_context,
-                                           const std::string &instance_id,
-                                           MetaSearcher *meta_searcher);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,
@@ -345,20 +335,6 @@ private:
     // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
     std::thread recover_retry_thread_;
     std::atomic<bool> recover_retry_stop_{false};
-    // 需要清理 - event snapshot 版本表由 event backend 内存维护，持久化版本恢复每个 instance 只做一次
-    std::mutex snapshot_version_recovery_mutex_;
-    std::condition_variable snapshot_version_recovery_cv_;
-    std::set<std::string> snapshot_version_recovering_instances_;
-    std::set<std::string> snapshot_version_recovered_instances_;
-    struct SnapshotCleanupState {
-        uint64_t latest_version = 0;
-        DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        std::shared_ptr<EventReportBackend> event_backend;
-        uint32_t retry_count = 0;
-    };
-    // 需要清理 - 同一 snapshot scope 最多保留一个后台扫描任务，连续版本合并到最新值
-    std::mutex snapshot_cleanup_mutex_;
-    std::unordered_map<SnapshotScopeKey, SnapshotCleanupState, SnapshotScopeKeyHash> snapshot_cleanup_states_;
 };
 
 } // namespace kv_cache_manager

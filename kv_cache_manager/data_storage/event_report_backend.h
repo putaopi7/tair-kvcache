@@ -64,21 +64,18 @@ public:
     uint64_t GetNodeGeneration(const std::string &instance_id, const std::string &host_ip_port) const;
 
     std::string BuildLocationId(const std::string &medium, const std::string &host_ip_port) const;
-    std::string
-    BuildSnapshotLocationId(const std::string &medium, const std::string &host_ip_port, uint64_t version) const;
     bool ParseLocationId(const std::string &location_id, std::string &out_medium, std::string &out_host_ip_port) const;
     std::string HostSuffix(const std::string &host_ip_port) const;
-    // A delta lease pins the committed version until every metadata mutation in
+    // A delta lease pins the committed token until every metadata mutation in
     // that ReportEvent request has completed.
-    bool BeginDeltaMutation(const SnapshotScopeKey &scope, uint64_t &out_committed_version);
+    ErrorCode BeginDeltaMutation(const SnapshotScopeKey &scope, std::string &out_committed_version);
     void EndDeltaMutation(const SnapshotScopeKey &scope);
-    // Returns 0 while another snapshot or any delta mutation is in flight.
-    uint64_t AllocateSnapshotVersion(const SnapshotScopeKey &scope);
-    bool CommitSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
-    void AbortSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
-    void ObserveAllocatedSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
-    void ObserveSnapshotVersion(const SnapshotScopeKey &scope, uint64_t version);
-    uint64_t GetSnapshotVersion(const SnapshotScopeKey &scope) const;
+    ErrorCode
+    BeginSnapshot(const SnapshotScopeKey &scope, std::string &out_candidate_version, uint64_t &out_retry_after_ms);
+    bool CommitSnapshotVersion(const SnapshotScopeKey &scope, const std::string &version);
+    void AbortSnapshotVersion(const SnapshotScopeKey &scope, const std::string &version);
+    std::string GetSnapshotVersion(const SnapshotScopeKey &scope) const;
+    void SetSnapshotMinIntervalMsForTest(int64_t interval_ms);
     DataStorageType GetStorageType() const;
 
 private:
@@ -110,17 +107,15 @@ private:
     // instance_id -> (host_ip_port -> generation)
     std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> node_generation_;
     struct SnapshotVersionState {
-        // Process-local scope state, not a distributed lock. HA correctness also
-        // relies on leader-only request fencing during ownership changes.
-        uint64_t allocated = 0;
-        uint64_t committed = 0;
-        uint64_t in_flight = 0;
+        // Process-local scope state, not a distributed lock. KVCM restart clears
+        // this state and requires the reporter to rebuild it with a full snapshot.
+        std::string committed;
+        std::string in_flight;
         uint64_t active_delta_mutations = 0;
+        int64_t last_commit_ms = 0;
     };
-    // Snapshot generations are durable scope state, not node-liveness state.
-    // They intentionally survive UnregisterNode so a re-registered reporter
-    // continues from the persisted high-water mark.
     std::unordered_map<SnapshotScopeKey, SnapshotVersionState, SnapshotScopeKeyHash> snapshot_versions_;
+    int64_t snapshot_min_interval_ms_ = 30'000;
 
     std::thread liveness_checker_thread_;
     std::atomic<bool> liveness_checker_running_{false};
