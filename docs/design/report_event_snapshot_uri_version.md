@@ -663,6 +663,8 @@ Reclaimer：
 ### 18.2 集成测试
 
 - reporter 一次上报 HBM+Memory，响应返回 committed token；
+- 首次 snapshot、实时 ADD/DELETE/HEARTBEAT、下一轮 snapshot 对账和后续实时增量串成一条完整链路，
+  每个阶段查询结果与 committed token 一致；
 - 查询只看到本次完整 host snapshot；
 - 下一轮遗漏 block/medium 后立即不可见，随后由现有 reclaimer 删除；
 - snapshot 后 ADD/DELETE 继承 token；

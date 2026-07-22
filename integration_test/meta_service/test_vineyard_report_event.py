@@ -1429,6 +1429,324 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertEqual(len(committed["committed_snapshot_version"]), 32)
 
+    def test_22_realtime_deltas_converge_with_periodic_snapshot(self):
+        host = "192.168.1.246:8080"
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_node_register(["mem", "disk", "gpu"])],
+                trace_id="t22_register",
+            )
+        )
+
+        baseline_uris = {
+            "linear_0": _build_event_report_uri(
+                host, "mem", {"source": "baseline_linear"}
+            ),
+            "mamba_0": _build_event_report_uri(
+                host, "mem", {"source": "baseline_mamba"}
+            ),
+            "full_3": _build_event_report_uri(
+                host, "disk", {"source": "baseline_disk"}
+            ),
+            "gpu_0": _build_event_report_uri(
+                host, "gpu", {"source": "baseline_gpu"}
+            ),
+        }
+        baseline = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_snapshot([
+                    {
+                        "block_key": 9220,
+                        "medium": "mem",
+                        "specs": [
+                            {"name": "linear_0", "uri": baseline_uris["linear_0"]},
+                            {"name": "mamba_0", "uri": baseline_uris["mamba_0"]},
+                        ],
+                    },
+                    {
+                        "block_key": 9221,
+                        "medium": "disk",
+                        "specs": _make_single_spec(
+                            "full_3", baseline_uris["full_3"]
+                        ),
+                    },
+                    {
+                        "block_key": 9222,
+                        "medium": "gpu",
+                        "specs": _make_single_spec(
+                            "gpu_0", baseline_uris["gpu_0"]
+                        ),
+                    },
+                ])],
+                trace_id="t22_baseline_snapshot",
+            )
+        )
+        version_1 = baseline["committed_snapshot_version"]
+        self.assertEqual(len(version_1), 32)
+        baseline_expected = {
+            9220: {
+                "linear_0": baseline_uris["linear_0"],
+                "mamba_0": baseline_uris["mamba_0"],
+            },
+            9221: {"full_3": baseline_uris["full_3"]},
+            9222: {"gpu_0": baseline_uris["gpu_0"]},
+        }
+        for block_key, expected_specs in baseline_expected.items():
+            specs = _wait_for_block_spec_names(
+                self.client,
+                self.instance_id,
+                block_key,
+                set(expected_specs),
+                f"t22_query_baseline_{block_key}",
+            )
+            for spec in specs:
+                _assert_reporter_scope(
+                    self,
+                    spec["uri"],
+                    expected_specs[spec["name"]],
+                    self.instance_id,
+                    host,
+                    "",
+                    version_1,
+                )
+
+        realtime_linear_uri = _build_event_report_uri(
+            host, "mem", {"source": "realtime_linear"}
+        )
+        realtime_mamba_uri = _build_event_report_uri(
+            host, "mem", {"source": "realtime_mamba"}
+        )
+        realtime_disk_uri = _build_event_report_uri(
+            host, "disk", {"source": "realtime_disk"}
+        )
+        realtime = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [
+                    _ev_block_add(
+                        9220,
+                        "mem",
+                        [
+                            {"name": "linear_0", "uri": realtime_linear_uri},
+                            {"name": "mamba_1", "uri": realtime_mamba_uri},
+                        ],
+                    ),
+                    _ev_block_delete(9221, "disk", ["full_3"]),
+                    _ev_block_add(
+                        9223,
+                        "disk",
+                        _make_single_spec("full_3", realtime_disk_uri),
+                    ),
+                    _ev_heartbeat({"report_mode": "realtime"}),
+                ],
+                trace_id="t22_realtime_batch",
+            )
+        )
+        self.assertEqual(
+            realtime.get("committed_snapshot_version"), version_1
+        )
+
+        realtime_specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            9220,
+            {"linear_0", "mamba_0", "mamba_1"},
+            "t22_query_realtime_update",
+        )
+        realtime_expected = {
+            "linear_0": realtime_linear_uri,
+            "mamba_0": baseline_uris["mamba_0"],
+            "mamba_1": realtime_mamba_uri,
+        }
+        for spec in realtime_specs:
+            _assert_reporter_scope(
+                self,
+                spec["uri"],
+                realtime_expected[spec["name"]],
+                self.instance_id,
+                host,
+                "",
+                version_1,
+            )
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            9221,
+            set(),
+            "t22_query_realtime_delete",
+        )
+        added_specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            9223,
+            {"full_3"},
+            "t22_query_realtime_add",
+        )
+        _assert_reporter_scope(
+            self,
+            added_specs[0]["uri"],
+            realtime_disk_uri,
+            self.instance_id,
+            host,
+            "disk",
+            version_1,
+        )
+
+        snapshot_2_linear_uri = _build_event_report_uri(
+            host, "mem", {"source": "snapshot_2_linear"}
+        )
+        snapshot_2_gpu_uri = _build_event_report_uri(
+            host, "gpu", {"source": "snapshot_2_gpu"}
+        )
+        snapshot_2_disk_uri = _build_event_report_uri(
+            host, "disk", {"source": "snapshot_2_disk"}
+        )
+        snapshot_2 = _ev_block_snapshot([
+            {
+                "block_key": 9220,
+                "medium": "mem",
+                "specs": _make_single_spec(
+                    "linear_0", snapshot_2_linear_uri
+                ),
+            },
+            {
+                "block_key": 9222,
+                "medium": "gpu",
+                "specs": _make_single_spec("gpu_0", snapshot_2_gpu_uri),
+            },
+            {
+                "block_key": 9224,
+                "medium": "disk",
+                "specs": _make_single_spec("full_3", snapshot_2_disk_uri),
+            },
+        ])
+        limited = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [snapshot_2],
+                trace_id="t22_snapshot_2_rate_limited",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            limited["header"]["status"]["code"], "SNAPSHOT_RATE_LIMITED"
+        )
+        self.assertEqual(
+            limited.get("committed_snapshot_version"), version_1
+        )
+
+        retry_deadline = (
+            time.monotonic()
+            + int(limited["retry_after_ms"]) / 1000.0
+            + 0.2
+        )
+        while time.monotonic() < retry_deadline:
+            remaining = retry_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.25, remaining))
+            heartbeat = self.client.report_event(
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_heartbeat({"report_mode": "realtime"})],
+                    trace_id="t22_wait_heartbeat",
+                )
+            )
+            self.assertEqual(
+                heartbeat.get("committed_snapshot_version"), version_1
+            )
+
+        reconciled = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [snapshot_2],
+                trace_id="t22_snapshot_2_commit",
+            )
+        )
+        version_2 = reconciled["committed_snapshot_version"]
+        self.assertEqual(len(version_2), 32)
+        self.assertNotEqual(version_1, version_2)
+
+        expected_after_reconcile = {
+            9220: {"linear_0": snapshot_2_linear_uri},
+            9221: {},
+            9222: {"gpu_0": snapshot_2_gpu_uri},
+            9223: {},
+            9224: {"full_3": snapshot_2_disk_uri},
+        }
+        for block_key, expected_specs in expected_after_reconcile.items():
+            specs = _wait_for_block_spec_names(
+                self.client,
+                self.instance_id,
+                block_key,
+                set(expected_specs),
+                f"t22_query_reconciled_{block_key}",
+            )
+            for spec in specs:
+                _assert_reporter_scope(
+                    self,
+                    spec["uri"],
+                    expected_specs[spec["name"]],
+                    self.instance_id,
+                    host,
+                    "",
+                    version_2,
+                )
+
+        post_snapshot_uri = _build_event_report_uri(
+            host, "mem", {"source": "post_snapshot_realtime"}
+        )
+        post_snapshot = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [
+                    _ev_block_delete(9220, "mem", ["linear_0"]),
+                    _ev_block_add(
+                        9225,
+                        "mem",
+                        _make_single_spec("linear_0", post_snapshot_uri),
+                    ),
+                    _ev_heartbeat({"report_mode": "realtime"}),
+                ],
+                trace_id="t22_post_snapshot_realtime",
+            )
+        )
+        self.assertEqual(
+            post_snapshot.get("committed_snapshot_version"), version_2
+        )
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            9220,
+            set(),
+            "t22_query_post_snapshot_delete",
+        )
+        post_snapshot_specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            9225,
+            {"linear_0"},
+            "t22_query_post_snapshot_add",
+        )
+        _assert_reporter_scope(
+            self,
+            post_snapshot_specs[0]["uri"],
+            post_snapshot_uri,
+            self.instance_id,
+            host,
+            "mem",
+            version_2,
+        )
+
 # ---------------------------------------------------------------------------
 # Bench tests
 # ---------------------------------------------------------------------------
