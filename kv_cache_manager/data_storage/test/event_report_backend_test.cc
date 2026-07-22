@@ -604,6 +604,46 @@ TEST(EventReportBackendSnapshotTest, UnregisterForcesFullSnapshotAgain) {
     EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(scope, committed));
 }
 
+TEST(EventReportBackendSnapshotTest, FailedDeltaClearsOutputAndDoesNotCreateACommit) {
+    EventReportBackend backend(nullptr);
+    std::string committed = "stale-token";
+
+    EXPECT_EQ(EC_BADARGS, backend.BeginDeltaMutation({"", "10.0.0.1:8080"}, committed));
+    EXPECT_TRUE(committed.empty());
+
+    committed = "stale-token";
+    const SnapshotScopeKey scope{"instance-a", "10.0.0.1:8080"};
+    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(scope, committed));
+    EXPECT_TRUE(committed.empty());
+    EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
+}
+
+TEST(EventReportBackendSnapshotTest, UnregisterThenReregisterRequiresNewSnapshot) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const std::string instance_id = "instance-a";
+    const std::string host = "10.0.0.1:8080";
+    const SnapshotScopeKey scope{instance_id, host};
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm", "dram"}));
+    std::string first_token;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, first_token, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(scope, first_token));
+
+    ASSERT_EQ(EC_OK, backend.UnregisterNode(instance_id, host));
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm", "dram"}));
+    EXPECT_TRUE(backend.GetSnapshotVersion(scope).empty());
+    std::string committed = "stale-token";
+    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, backend.BeginDeltaMutation(scope, committed));
+    EXPECT_TRUE(committed.empty());
+
+    std::string second_token;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(scope, second_token, retry_after_ms));
+    EXPECT_NE(first_token, second_token);
+    EXPECT_TRUE(backend.CommitSnapshotVersion(scope, second_token));
+}
+
 TEST(EventReportBackendSnapshotTest, StableLocationIdHasNoSnapshotGeneration) {
     EventReportBackend backend(nullptr);
     const std::string location_id = backend.BuildLocationId("hbm", "10.0.0.1:8080");

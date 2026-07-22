@@ -1068,7 +1068,7 @@ class EventReportFunctionalTest(unittest.TestCase):
             version,
         )
 
-    # 18. Snapshot scope is exactly (instance, reporter host, medium).
+    # 18. Snapshot scope is (instance, reporter host); medium is per-block.
     def test_18_snapshot_scope_isolation(self):
         host_a = "192.168.1.241:8080"
         host_b = "192.168.1.242:8080"
@@ -1235,6 +1235,98 @@ class EventReportFunctionalTest(unittest.TestCase):
         self.assertEqual(malformed.get("committed_snapshot_version", ""), "")
         self.assertTrue(malformed.get("snapshot_required"))
 
+    def test_20_host_down_then_reregister_requires_new_snapshot(self):
+        host = "192.168.1.244:8080"
+        register = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_node_register(["mem", "disk"])],
+                trace_id="t20_register",
+            )
+        )
+        self.assertTrue(register.get("snapshot_required"))
+
+        first = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_snapshot("mem", [])],
+                trace_id="t20_first_snapshot",
+            )
+        )
+        first_token = first["committed_snapshot_version"]
+        self.assertEqual(len(first_token), 32)
+
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_host_down()],
+                trace_id="t20_host_down",
+            )
+        )
+
+        reregister = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_node_register(["mem", "disk"])],
+                trace_id="t20_reregister",
+            )
+        )
+        self.assertTrue(reregister.get("snapshot_required"))
+        self.assertEqual(reregister.get("committed_snapshot_version", ""), "")
+
+        rejected_delta = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_add(
+                    "9200",
+                    "mem",
+                    _make_single_spec(
+                        "linear_0", _build_event_report_uri(host, "mem")
+                    ),
+                )],
+                trace_id="t20_delta_before_resnapshot",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            rejected_delta["header"]["status"]["code"],
+            "SNAPSHOT_REQUIRED",
+        )
+
+        second = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_snapshot("mem", [])],
+                trace_id="t20_second_snapshot",
+            )
+        )
+        second_token = second["committed_snapshot_version"]
+        self.assertEqual(len(second_token), 32)
+        self.assertNotEqual(first_token, second_token)
+
+        accepted_delta = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_add(
+                    "9200",
+                    "mem",
+                    _make_single_spec(
+                        "linear_0", _build_event_report_uri(host, "mem")
+                    ),
+                )],
+                trace_id="t20_delta_after_resnapshot",
+            )
+        )
+        self.assertEqual(
+            accepted_delta.get("committed_snapshot_version"), second_token
+        )
 # ---------------------------------------------------------------------------
 # Bench tests
 # ---------------------------------------------------------------------------

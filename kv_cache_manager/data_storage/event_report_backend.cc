@@ -474,11 +474,16 @@ bool EventReportBackend::ParseLocationId(const std::string &location_id,
 std::string EventReportBackend::HostSuffix(const std::string &host_ip_port) const { return "#" + host_ip_port; }
 
 ErrorCode EventReportBackend::BeginDeltaMutation(const SnapshotScopeKey &scope, std::string &out_committed_version) {
+    out_committed_version.clear();
     if (scope.instance_id.empty() || scope.host_ip_port.empty()) {
         return EC_BADARGS;
     }
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto &state = snapshot_versions_[scope];
+    auto it = snapshot_versions_.find(scope);
+    if (it == snapshot_versions_.end()) {
+        return EC_SNAPSHOT_REQUIRED;
+    }
+    auto &state = it->second;
     if (!state.in_flight.empty()) {
         return EC_SNAPSHOT_IN_PROGRESS;
     }
