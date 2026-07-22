@@ -1,6 +1,8 @@
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 
 #include "kv_cache_manager/common/jsonizable.h"
@@ -23,6 +25,7 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/utils.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -91,6 +94,49 @@ public:
 private:
     std::shared_ptr<DataStorageBackend> delegate_;
     MightExistFunc fn_;
+};
+
+class DeleteRecordingBackend : public DataStorageBackend {
+public:
+    explicit DeleteRecordingBackend(std::shared_ptr<DataStorageBackend> delegate)
+        : DataStorageBackend(delegate->metrics_registry_), delegate_(std::move(delegate)) {
+        SetOpen(delegate_->IsOpen());
+        SetAvailable(true);
+    }
+
+    DataStorageType GetType() override { return delegate_->GetType(); }
+    bool Available() override { return delegate_->Available(); }
+    double GetStorageUsageRatio(const std::string &trace_id) const override {
+        return delegate_->GetStorageUsageRatio(trace_id);
+    }
+    const StorageConfig &GetStorageConfig() override { return delegate_->GetStorageConfig(); }
+    ErrorCode DoOpen(const StorageConfig &config, const std::string &trace_id) override {
+        return delegate_->DoOpen(config, trace_id);
+    }
+    ErrorCode Close() override { return delegate_->Close(); }
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        return delegate_->Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &uris, const std::string &trace_id, std::function<void()> cb) override {
+        deleted_uri_count_.fetch_add(uris.size(), std::memory_order_relaxed);
+        return delegate_->Delete(uris, trace_id, std::move(cb));
+    }
+    std::vector<bool> Exist(const std::vector<DataStorageUri> &uris) override { return delegate_->Exist(uris); }
+    std::vector<bool> MightExist(const std::vector<DataStorageUri> &uris) override {
+        return delegate_->MightExist(uris);
+    }
+    std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &uris) override { return delegate_->Lock(uris); }
+    std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &uris) override { return delegate_->UnLock(uris); }
+
+    size_t DeletedUriCount() const { return deleted_uri_count_.load(std::memory_order_relaxed); }
+
+private:
+    std::shared_ptr<DataStorageBackend> delegate_;
+    std::atomic<size_t> deleted_uri_count_{0};
 };
 
 class CacheManagerTest : public TESTBASE {
@@ -346,6 +392,67 @@ TEST_F(CacheManagerTest, TestStartWriteCache) {
             // ASSERT_EQ(expected, location_specs[j].location());
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestStartWriteCacheRollsBackPartialBatchAdd) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance");
+    ASSERT_TRUE(meta_indexer);
+    meta_indexer->batch_key_size_ = 1;
+    meta_indexer->max_key_count_ = 1;
+
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    ASSERT_TRUE(data_storage_manager);
+    auto original_backend = data_storage_manager->GetDataStorageBackend("nfs_01");
+    ASSERT_TRUE(original_backend);
+    auto recording_backend = std::make_shared<DeleteRecordingBackend>(original_backend);
+    {
+        std::unique_lock<std::shared_mutex> lock(data_storage_manager->rw_lock_);
+        data_storage_manager->storage_map_["nfs_01"] = recording_backend;
+    }
+
+    std::vector<int64_t> keys{1001, 1002};
+    while (GetShardIndex(keys[0], meta_indexer->mutex_shard_mask_) ==
+           GetShardIndex(keys[1], meta_indexer->mutex_shard_mask_)) {
+        ++keys[1];
+    }
+    auto [ec, start_write_cache_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 1000);
+    EXPECT_EQ(EC_PARTIAL_OK, ec);
+    EXPECT_TRUE(start_write_cache_info.locations().cache_locations_view().empty());
+
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_TRUE(meta_searcher);
+    std::vector<CacheLocationMap> location_maps;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    bool rollback_completed = false;
+    do {
+        location_maps.clear();
+        BlockMask empty_mask;
+        const ErrorCode get_ec =
+            meta_searcher->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps);
+        const bool metadata_removed = get_ec == EC_OK && location_maps.size() == keys.size() &&
+                                      std::all_of(location_maps.begin(),
+                                                  location_maps.end(),
+                                                  [](const auto &locations) { return locations.empty(); });
+        rollback_completed = metadata_removed && meta_indexer->GetStorageUsage() == 0 &&
+                             recording_backend->DeletedUriCount() >= keys.size() * createLocationSpecInfos().size();
+        if (!rollback_completed) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    } while (!rollback_completed && std::chrono::steady_clock::now() < deadline);
+
+    EXPECT_TRUE(rollback_completed);
+    EXPECT_EQ(keys.size() * createLocationSpecInfos().size(), recording_backend->DeletedUriCount());
 }
 
 TEST_F(CacheManagerTest, TestStartWriteDuplicateCache) {

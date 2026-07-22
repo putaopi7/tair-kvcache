@@ -31,6 +31,21 @@ public:
 CheckLocDataExistFunc dummy_check_loc_data_exist = [](const CacheLocation &) -> bool { return true; };
 SubmitDelReqFunc dummy_submit_del_req = [](const std::vector<std::int64_t> &,
                                            const std::vector<std::vector<std::string>> &) -> void {};
+
+ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
+                                  RequestContext *request_context,
+                                  const KeyVector &keys,
+                                  const CacheLocationVector &locations,
+                                  std::vector<std::string> &out_location_ids) {
+    std::vector<MetaSearcher::AddLocationResult> results;
+    const ErrorCode ec = meta_searcher->BatchAddLocation(request_context, keys, locations, results);
+    out_location_ids.clear();
+    out_location_ids.reserve(results.size());
+    for (const auto &result : results) {
+        out_location_ids.push_back(result.location_id);
+    }
+    return ec;
+}
 } // namespace
 
 class MetaSearcherRealServiceTest : public TESTBASE {
@@ -92,7 +107,8 @@ TEST_F(MetaSearcherRealServiceTest, TestBatchAddAndGetLocation) {
 
     // 调用BatchAddLocation
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
 
     // 验证结果
     EXPECT_EQ(ec, ErrorCode::EC_OK);
@@ -130,7 +146,8 @@ TEST_F(MetaSearcherRealServiceTest, TestBatchUpdateLocationStatus) {
 
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 3);
 
@@ -191,7 +208,8 @@ TEST_F(MetaSearcherRealServiceTest, TestPrefixMatchWithServingStatus) {
 
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 3);
 
@@ -249,7 +267,8 @@ TEST_F(MetaSearcherRealServiceTest, TestConcurrentOperations) {
 
             // 添加位置信息
             std::vector<std::string> out_location_ids;
-            ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+            ErrorCode ec = BatchAddLocationForTest(
+                meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
             ASSERT_EQ(ec, ErrorCode::EC_OK);
             ASSERT_EQ(out_location_ids.size(), 3);
 
@@ -308,7 +327,8 @@ TEST_F(MetaSearcherRealServiceTest, TestBatchVsSequentialPerformance) {
 
     // 批量添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
 
     // 将所有位置更新为SERVING状态

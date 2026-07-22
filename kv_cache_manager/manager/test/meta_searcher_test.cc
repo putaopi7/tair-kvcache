@@ -6,6 +6,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
+#include "kv_cache_manager/meta/utils.h"
 
 using namespace kv_cache_manager;
 
@@ -33,6 +34,21 @@ public:
 CheckLocDataExistFunc dummy_check_loc_data_exist = [](const CacheLocation &) -> bool { return true; };
 SubmitDelReqFunc dummy_submit_del_req = [](const std::vector<std::int64_t> &,
                                            const std::vector<std::vector<std::string>> &) -> void {};
+
+ErrorCode BatchAddLocationForTest(MetaSearcher *meta_searcher,
+                                  RequestContext *request_context,
+                                  const KeyVector &keys,
+                                  const CacheLocationVector &locations,
+                                  std::vector<std::string> &out_location_ids) {
+    std::vector<MetaSearcher::AddLocationResult> results;
+    const ErrorCode ec = meta_searcher->BatchAddLocation(request_context, keys, locations, results);
+    out_location_ids.clear();
+    out_location_ids.reserve(results.size());
+    for (const auto &result : results) {
+        out_location_ids.push_back(result.location_id);
+    }
+    return ec;
+}
 } // namespace
 
 class MetaSearcherTest : public TESTBASE {
@@ -99,12 +115,16 @@ TEST_F(MetaSearcherTest, TestBatchAddLocation) {
     CacheLocationVector locations = {location1, location2, location3};
 
     // 调用BatchAddLocation
-    std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    std::vector<MetaSearcher::AddLocationResult> add_results;
+    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, add_results);
 
     // 验证结果
     EXPECT_EQ(ec, ErrorCode::EC_OK);
-    EXPECT_EQ(out_location_ids.size(), 3);
+    ASSERT_EQ(add_results.size(), keys.size());
+    for (const auto &result : add_results) {
+        EXPECT_EQ(result.ec, ErrorCode::EC_OK);
+        EXPECT_FALSE(result.location_id.empty());
+    }
 
     // 验证添加的位置信息可以被检索到
     std::vector<CacheLocationMap> out_location_maps;
@@ -114,10 +134,55 @@ TEST_F(MetaSearcherTest, TestBatchAddLocation) {
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_maps.size(), 3);
 
-    for (const auto &location_map : out_location_maps) {
+    for (size_t i = 0; i < out_location_maps.size(); ++i) {
+        const auto &location_map = out_location_maps[i];
         EXPECT_FALSE(location_map.empty());
         // 每个map应该只有一个location（我们刚添加的）
         EXPECT_EQ(location_map.size(), 1);
+        EXPECT_NE(location_map.find(add_results[i].location_id), location_map.end());
+    }
+}
+
+TEST_F(MetaSearcherTest, TestBatchAddLocationReturnsAlignedPartialResults) {
+    meta_indexer_->batch_key_size_ = 1;
+    meta_indexer_->max_key_count_ = 1;
+
+    MetaSearcher::KeyVector keys = {1001, 1002};
+    while (GetShardIndex(keys[0], meta_indexer_->mutex_shard_mask_) ==
+           GetShardIndex(keys[1], meta_indexer_->mutex_shard_mask_)) {
+        ++keys[1];
+    }
+    auto location = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, MetaSearcherTestHelper::CreateDefaultLocationSpecs());
+    CacheLocationVector locations = {location, location};
+
+    std::vector<MetaSearcher::AddLocationResult> add_results;
+    const ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, add_results);
+
+    EXPECT_EQ(ec, ErrorCode::EC_PARTIAL_OK);
+    ASSERT_EQ(add_results.size(), keys.size());
+    size_t success_count = 0;
+    size_t failure_count = 0;
+    for (const auto &result : add_results) {
+        // 两个 modifier 都已生成 id；失败项的 id 只能用于回滚定位。
+        EXPECT_FALSE(result.location_id.empty());
+        if (result.ec == ErrorCode::EC_OK) {
+            ++success_count;
+        } else {
+            EXPECT_EQ(result.ec, ErrorCode::EC_NOSPC);
+            ++failure_count;
+        }
+    }
+    EXPECT_EQ(success_count, 1);
+    EXPECT_EQ(failure_count, 1);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, location_maps));
+    ASSERT_EQ(location_maps.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool persisted = location_maps[i].find(add_results[i].location_id) != location_maps[i].end();
+        EXPECT_EQ(persisted, add_results[i].ec == ErrorCode::EC_OK);
     }
 }
 
@@ -146,7 +211,8 @@ TEST_F(MetaSearcherTest, TestBatchAddLocation2) {
 
     // 调用BatchAddLocation
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
 
     // 验证结果
     EXPECT_EQ(ec, ErrorCode::EC_OK);
@@ -187,7 +253,8 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
     CacheLocationVector locations = {location1, location2, location3};
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 3);
 
@@ -285,7 +352,8 @@ TEST_F(MetaSearcherTest, TestBatchGet) {
 
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 3);
 
@@ -355,7 +423,8 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatus) {
 
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 3);
 
@@ -480,9 +549,12 @@ TEST_F(MetaSearcherTest, TestBlockKeyWithMultipleLocations) {
     // 分别调用三次BatchAddLocation，为同一个key添加三个不同的location
     std::vector<std::string> out_location_ids1, out_location_ids2, out_location_ids3;
 
-    ErrorCode ec1 = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations1, out_location_ids1);
-    ErrorCode ec2 = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations2, out_location_ids2);
-    ErrorCode ec3 = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations3, out_location_ids3);
+    ErrorCode ec1 =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations1, out_location_ids1);
+    ErrorCode ec2 =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations2, out_location_ids2);
+    ErrorCode ec3 =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations3, out_location_ids3);
 
     // 验证结果
     EXPECT_EQ(ec1, ErrorCode::EC_OK);
@@ -543,7 +615,8 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocation) {
 
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 3);
 
@@ -638,7 +711,8 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocation2) {
 
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 3);
 
@@ -671,7 +745,8 @@ TEST_F(MetaSearcherTest, TestBatchVsSequentialPerformance) {
     }
 
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
 
     std::vector<CacheLocationStatus> statuses(out_location_ids.size(), CacheLocationStatus::CLS_SERVING);
@@ -737,7 +812,8 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatus) {
 
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 3);
 
@@ -845,7 +921,8 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatus) {
 
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 3);
 
@@ -943,7 +1020,8 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatus2) {
 
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 3);
 
@@ -995,7 +1073,8 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatusMultipleTasksPerKey) {
 
     // 添加位置信息
     std::vector<std::string> out_location_ids;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations, out_location_ids);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids.size(), 1);
 
@@ -1003,7 +1082,7 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatusMultipleTasksPerKey) {
     CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 1, location_specs);
     std::vector<std::string> out_location_ids2;
-    ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, {location2}, out_location_ids2);
+    ec = BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, {location2}, out_location_ids2);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids2.size(), 1);
 
@@ -1062,14 +1141,15 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatusMultipleTasksPerKey) {
     // 添加第一个位置信息
     CacheLocationVector locations1 = {location1};
     std::vector<std::string> out_location_ids1;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations1, out_location_ids1);
+    ErrorCode ec =
+        BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations1, out_location_ids1);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids1.size(), 1);
 
     // 添加第二个位置到同一个key
     CacheLocationVector locations2 = {location2};
     std::vector<std::string> out_location_ids2;
-    ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations2, out_location_ids2);
+    ec = BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations2, out_location_ids2);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_ids2.size(), 1);
 
@@ -1201,14 +1281,14 @@ TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsByStorageType) {
     // Add location A to all keys
     CacheLocationVector locations_a = {loc_a, loc_a, loc_a};
     std::vector<std::string> out_ids_a;
-    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations_a, out_ids_a);
+    ErrorCode ec = BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations_a, out_ids_a);
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out_ids_a.size(), 3);
 
     // Add location B to all keys
     CacheLocationVector locations_b = {loc_b, loc_b, loc_b};
     std::vector<std::string> out_ids_b;
-    ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations_b, out_ids_b);
+    ec = BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locations_b, out_ids_b);
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out_ids_b.size(), 3);
 
@@ -1264,7 +1344,7 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
     {
         CacheLocationVector locs = {loc_a, loc_c};
         std::vector<std::string> out_ids;
-        ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locs, out_ids);
+        ErrorCode ec = BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), keys, locs, out_ids);
         ASSERT_EQ(ec, ErrorCode::EC_OK);
 
         std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks;
@@ -1281,7 +1361,7 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
         MetaSearcher::KeyVector key_60000 = {60000};
         CacheLocationVector locs = {loc_b};
         std::vector<std::string> out_ids;
-        ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), key_60000, locs, out_ids);
+        ErrorCode ec = BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), key_60000, locs, out_ids);
         ASSERT_EQ(ec, ErrorCode::EC_OK);
 
         std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks;
@@ -1393,7 +1473,7 @@ protected:
                 1,
                 {MetaSearcherTestHelper::CreateLocationSpec("tp0", "tair://host_t:6379/tp0")});
             std::vector<std::string> out_ids;
-            ec = meta_searcher_->BatchAddLocation(request_context_.get(), {key}, {tair_loc}, out_ids);
+            ec = BatchAddLocationForTest(meta_searcher_.get(), request_context_.get(), {key}, {tair_loc}, out_ids);
             ASSERT_EQ(ec, ErrorCode::EC_OK);
             std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
             std::vector<std::vector<ErrorCode>> results;
