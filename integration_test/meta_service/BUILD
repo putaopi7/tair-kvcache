@@ -53,3 +53,16 @@ py_test(
     ],
     deps = ["@pip_cpu//requests"],
 )
+
+py_binary(
+    name = "test_report_event_restart",
+    srcs = [
+        "test_report_event_restart.py",
+        "test_vineyard_report_event.py",
+    ],
+    tags = [
+        "manual",
+        "no-remote-exec",
+    ],
+    deps = ["@pip_cpu//requests"],
+)

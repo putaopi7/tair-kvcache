@@ -37,6 +37,7 @@ ONLY_BENCH = False
 ENABLE_LIVENESS_TIMING_TESTS = False
 HEARTBEAT_TIMEOUT_MS = 1000
 CLEANUP_GRACE_MS = 2000
+META_STORAGE_URI = ""
 
 
 class KVCMClient:
@@ -401,7 +402,10 @@ class EventReportFunctionalTest(unittest.TestCase):
                         "max_key_count": 1000000,
                         "mutex_shard_num": 16,
                         "batch_key_size": 16,
-                        "meta_storage_backend_config": {"storage_type": "local", "storage_uri": ""},
+                        "meta_storage_backend_config": {
+                            "storage_type": "local",
+                            "storage_uri": META_STORAGE_URI,
+                        },
                         "meta_cache_policy_config": {"type": "LRU", "capacity": 10000},
                     },
                 },
@@ -2132,6 +2136,11 @@ def main():
     )
     parser.add_argument("--heartbeat-timeout-ms", type=int, default=1000)
     parser.add_argument("--cleanup-grace-ms", type=int, default=2000)
+    parser.add_argument(
+        "--meta-storage-uri",
+        default="",
+        help="Persistent local/Redis metadata URI used when creating the test instance group.",
+    )
 
     args, _ = parser.parse_known_args()
 
@@ -2139,7 +2148,7 @@ def main():
 
     global BASE_URL, ADMIN_URL, INSTANCE_ID, SKIP_BENCH, ONLY_BENCH
     global ENABLE_LIVENESS_TIMING_TESTS
-    global HEARTBEAT_TIMEOUT_MS, CLEANUP_GRACE_MS
+    global HEARTBEAT_TIMEOUT_MS, CLEANUP_GRACE_MS, META_STORAGE_URI
     BASE_URL = f"http://{args.host}:{args.http_port}"
     ADMIN_URL = f"http://{args.host}:{admin_port}"
     INSTANCE_ID = args.instance_id
@@ -2148,6 +2157,7 @@ def main():
     ENABLE_LIVENESS_TIMING_TESTS = args.enable_liveness_timing_tests
     HEARTBEAT_TIMEOUT_MS = args.heartbeat_timeout_ms
     CLEANUP_GRACE_MS = args.cleanup_grace_ms
+    META_STORAGE_URI = args.meta_storage_uri
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()

@@ -680,6 +680,12 @@ Reclaimer：
 - 10 host × 5000 blocks 压测记录 Redis ops、commit latency、scan latency 和 backlog；
 - ASAN/TSAN 或等价并发检测覆盖 snapshot/delta/reclaimer。
 
+真实进程重启用例由 `test_report_event_restart.py` 分成两个阶段执行，并为 registry 与
+instance metadata 配置持久化存储：`prepare` 阶段建立 snapshot 基线并记录 token，测试驱动
+随后停止并重新启动 KVCM 进程，`verify` 阶段复用原 instance，依次验证旧数据不可见、
+REGISTER 要求重建、重建前 delta 返回 `SNAPSHOT_REQUIRED`，以及新 snapshot 提交后查询
+恢复且 token 不复用。该用例必须真正跨越两个 KVCM 进程，不能用同进程内清空对象代替。
+
 ## 19. 可观测性
 
 建议提供：
