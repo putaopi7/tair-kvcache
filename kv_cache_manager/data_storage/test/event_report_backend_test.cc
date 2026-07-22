@@ -710,6 +710,15 @@ TEST(EventReportBackendSnapshotTest, SnapshotRateLimitReturnsRetryDelay) {
     EXPECT_LE(retry_after_ms, 30'000u);
     EXPECT_TRUE(second.empty());
 
+    const uint64_t first_retry_after_ms = retry_after_ms;
+    std::this_thread::sleep_for(2ms);
+    second = "stale";
+    retry_after_ms = 0;
+    EXPECT_EQ(EC_SNAPSHOT_RATE_LIMITED, backend.BeginSnapshot(scope, second, retry_after_ms));
+    EXPECT_TRUE(second.empty());
+    EXPECT_GT(retry_after_ms, 0u);
+    EXPECT_LE(retry_after_ms, first_retry_after_ms);
+
     backend.SetSnapshotMinIntervalMsForTest(0);
     EXPECT_EQ(EC_OK, backend.BeginSnapshot(scope, second, retry_after_ms));
     backend.AbortSnapshotVersion(scope, second);
@@ -814,6 +823,81 @@ TEST(EventReportBackendSnapshotTest, StableLocationIdHasNoSnapshotGeneration) {
     EXPECT_FALSE(backend.ParseLocationId("kvs#event_report#hbm#snapshot_v=7#10.0.0.1:8080", medium, host));
 }
 
+TEST(EventReportBackendSnapshotTest, RegisterAndHeartbeatPreserveCommittedToken) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const std::string instance_id = "instance-a";
+    const std::string host = "10.0.0.1:8080";
+    const ReporterSnapshotKey reporter_key{instance_id, host};
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm"}));
+    std::string token;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, token, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, token));
+
+    EXPECT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"memory"}));
+    EXPECT_EQ(EC_OK, backend.OnHeartbeat(instance_id, host, {{"load", "1"}}));
+    EXPECT_EQ(token, backend.GetSnapshotVersion(reporter_key));
+
+    std::string committed;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, committed));
+    EXPECT_EQ(token, committed);
+    backend.EndDeltaMutation(reporter_key);
+}
+
+TEST(EventReportBackendSnapshotTest, InvalidInputsDoNotMutateOrReleaseSnapshotState) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.1:8080"};
+
+    std::string candidate = "stale";
+    uint64_t retry_after_ms = 99;
+    EXPECT_EQ(EC_BADARGS, backend.BeginSnapshot({"", reporter_key.host_ip_port}, candidate, retry_after_ms));
+    EXPECT_TRUE(candidate.empty());
+    EXPECT_EQ(0u, retry_after_ms);
+
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms));
+    ASSERT_TRUE(IsValidSnapshotVersionToken(candidate));
+    EXPECT_FALSE(backend.CommitSnapshotVersion(reporter_key, ""));
+    EXPECT_FALSE(backend.CommitSnapshotVersion(reporter_key, std::string(31, 'a')));
+    EXPECT_FALSE(backend.CommitSnapshotVersion(reporter_key, std::string(32, 'g')));
+
+    backend.AbortSnapshotVersion(reporter_key, std::string(32, 'f'));
+    std::string blocked = "stale";
+    retry_after_ms = 99;
+    EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, backend.BeginSnapshot(reporter_key, blocked, retry_after_ms));
+    EXPECT_TRUE(blocked.empty());
+    EXPECT_EQ(0u, retry_after_ms);
+
+    backend.AbortSnapshotVersion(reporter_key, candidate);
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms));
+    backend.AbortSnapshotVersion(reporter_key, candidate);
+}
+
+TEST(EventReportBackendSnapshotTest, LocationIdParserRejectsMalformedAndLegacyIds) {
+    EventReportBackend backend(nullptr);
+    std::string medium;
+    std::string host;
+
+    const std::string valid = backend.BuildLocationId("hbm-cache", "host.example:8080");
+    ASSERT_TRUE(backend.ParseLocationId(valid, medium, host));
+    EXPECT_EQ("hbm-cache", medium);
+    EXPECT_EQ("host.example:8080", host);
+
+    for (const std::string &invalid : {
+             std::string{},
+             std::string{"kvs#event_report#"},
+             std::string{"kvs#event_report##host:8080"},
+             std::string{"kvs#event_report#hbm#"},
+             std::string{"kvs#event_report#hbm#host:8080#extra"},
+             std::string{"kvs#event_report#hbm#snapshot_v=7#host:8080"},
+             std::string{"other#event_report#hbm#host:8080"},
+         }) {
+        EXPECT_FALSE(backend.ParseLocationId(invalid, medium, host)) << invalid;
+    }
+}
+
 TEST(EventReportBackendSnapshotTest, UriCarriesOnlyOpaqueSnapshotToken) {
     const std::string token = "00112233445566778899aabbccddeeff";
     const std::string reporter_uri = "vineyard://127.0.0.1:9600/object?size=1024";
@@ -832,4 +916,31 @@ TEST(EventReportBackendSnapshotTest, UriCarriesOnlyOpaqueSnapshotToken) {
     EXPECT_FALSE(IsValidSnapshotVersionToken(""));
     EXPECT_FALSE(IsValidSnapshotVersionToken("7"));
     EXPECT_FALSE(IsValidSnapshotVersionToken(std::string(32, 'g')));
+}
+
+TEST(EventReportBackendSnapshotTest, SnapshotUriUtilitiesHandleExactParameterBoundaries) {
+    const std::string token = "00112233445566778899aabbccddeeff";
+    const std::string raw_uri =
+        "event_report://10.0.0.1:8080/mem?size=7&user_s_version=kept&s_version_hint=kept";
+    EXPECT_EQ(0u, CountUriParam(raw_uri, KVCM_SNAPSHOT_VERSION_PARAM));
+
+    std::string versioned_uri;
+    ASSERT_TRUE(AddSnapshotVersionToUri(raw_uri, token, versioned_uri));
+    EXPECT_EQ(1u, CountUriParam(versioned_uri, KVCM_SNAPSHOT_VERSION_PARAM));
+    const DataStorageUri parsed(versioned_uri);
+    ASSERT_TRUE(parsed.Valid());
+    EXPECT_EQ("7", parsed.GetParam("size"));
+    EXPECT_EQ("kept", parsed.GetParam("user_s_version"));
+    EXPECT_EQ("kept", parsed.GetParam("s_version_hint"));
+    EXPECT_EQ(token, parsed.GetParam(KVCM_SNAPSHOT_VERSION_PARAM));
+
+    SnapshotUriInfo info;
+    EXPECT_FALSE(ParseSnapshotUriInfo(raw_uri, info));
+    EXPECT_FALSE(ParseSnapshotUriInfo(
+        "event_report://10.0.0.1:8080/mem?s_version=" + std::string(31, 'a'), info));
+    EXPECT_FALSE(ParseSnapshotUriInfo(
+        "event_report://10.0.0.1:8080/mem?s_version=" + std::string(32, 'g'), info));
+    EXPECT_FALSE(ParseSnapshotUriInfo(versioned_uri + "&s_version=" + token, info));
+    EXPECT_FALSE(AddSnapshotVersionToUri("", token, versioned_uri));
+    EXPECT_FALSE(AddSnapshotVersionToUri(raw_uri, std::string(31, 'a'), versioned_uri));
 }

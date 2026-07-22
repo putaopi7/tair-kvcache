@@ -625,6 +625,7 @@ Location、URI 与 token：
 - UUID/token 不复用；
 - `s_version` 重复、非法或不匹配时 fail closed；
 - snapshot-required 状态下旧数据全部不可见。
+- 同 token 的 ADD 按 spec name 合并，历史 token 和无 token 的残留 spec 不会混入当前版本；
 
 提交与恢复：
 
@@ -634,6 +635,7 @@ Location、URI 与 token：
 - 响应成功返回新 token，失败返回旧 token；
 - 重启不恢复 token，全部 reporter 进入 snapshot-required；
 - REGISTER/HEARTBEAT 能通知节点重新汇报；
+- 已完成 snapshot 后，重复 REGISTER 和 HEARTBEAT 不清空 committed token；
 - 完整 snapshot 前 ADD/DELETE 被拒绝。
 
 并发、错误码和限流：
@@ -657,6 +659,7 @@ Reclaimer：
 - 清理中断后查询仍正确；
 - 下一次 snapshot 再触发残留清理；
 - cleanup 扫描后 location 被下一轮 snapshot 原地刷新时，条件删除必须跳过新值；
+- cleanup 提交给现有 reclaimer 时携带扫描时观察到的完整 location 值；
 - cleanup 扫描遇到下一轮 snapshot 的 in-flight token 时不能把它选为旧数据；
 - 不存在 snapshot 专用调度/退避状态。
 
@@ -668,6 +671,7 @@ Reclaimer：
 - 查询只看到本次完整 host snapshot；
 - 下一轮遗漏 block/medium 后立即不可见，随后由现有 reclaimer 删除；
 - snapshot 后 ADD/DELETE 继承 token；
+- ADD/DELETE 至少一次重试保持幂等，批内单个非法事件不回滚同批已成功的合法增量；
 - busy、rate-limit、snapshot-required 与 invalid argument 错误可区分；
 - Sync/内存发布前故障后 token 不变化，完整重试恢复；
 - KVCM 重启后旧数据不可见，所有 reporter 被通知重新 snapshot；

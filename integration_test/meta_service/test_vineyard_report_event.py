@@ -629,8 +629,14 @@ class EventReportFunctionalTest(unittest.TestCase):
                 trace_id="t06b",
             )
         )
-        self.assertIn("header", body)
-        # Query-after-delete skipped: MetaSearchCache may still serve stale entry.
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            block_key,
+            set(),
+            "t06_query_after_delete",
+        )
 
     # 7. BLOCK_DELETE on missing key/medium is a no-op (idempotent)
     def test_07_block_delete_nonexistent(self):
@@ -642,7 +648,14 @@ class EventReportFunctionalTest(unittest.TestCase):
             ),
             check_ok=False,
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            99999,
+            set(),
+            "t07_query_missing",
+        )
 
     # 8. HOST_DOWN cleans up all mediums under the host
     def test_08_host_down(self):
@@ -686,7 +699,17 @@ class EventReportFunctionalTest(unittest.TestCase):
         body = self.client.report_event(
             _make_request(self.instance_id, down_host, [_ev_host_down()], trace_id="t08b")
         )
-        self.assertIn("header", body)
+        self.assertEqual(body["header"]["status"]["code"], "OK")
+        self.assertTrue(body.get("snapshot_required"))
+        self.assertEqual(body.get("committed_snapshot_version", ""), "")
+        for block_key in block_keys:
+            _wait_for_block_spec_names(
+                self.client,
+                self.instance_id,
+                block_key,
+                set(),
+                f"t08_query_after_host_down_{block_key}",
+            )
 
     # 9. HOST_DOWN is idempotent
     def test_09_host_down_idempotent(self):
@@ -700,8 +723,8 @@ class EventReportFunctionalTest(unittest.TestCase):
         body2 = self.client.report_event(
             _make_request(self.instance_id, down_host, [_ev_host_down()], trace_id="t09c")
         )
-        self.assertIn("header", body1)
-        self.assertIn("header", body2)
+        self.assertEqual(body1["header"]["status"]["code"], "OK")
+        self.assertEqual(body2["header"]["status"]["code"], "OK")
 
     # 10. HEARTBEAT extends liveness; payload is opaque
     def test_10_heartbeat(self):
@@ -1746,6 +1769,186 @@ class EventReportFunctionalTest(unittest.TestCase):
             "mem",
             version_2,
         )
+
+    def test_23_retries_and_partial_batch_failure_preserve_progress(self):
+        host = "192.168.1.247:8080"
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_node_register(["mem", "disk", "gpu"])],
+                trace_id="t23_register",
+            )
+        )
+
+        baseline_mem_uri = _build_event_report_uri(
+            host, "mem", {"source": "baseline_mem"}
+        )
+        baseline_gpu_uri = _build_event_report_uri(
+            host, "gpu", {"source": "baseline_gpu"}
+        )
+        baseline = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_block_snapshot([
+                    {
+                        "block_key": 9230,
+                        "medium": "mem",
+                        "specs": _make_single_spec(
+                            "linear_0", baseline_mem_uri
+                        ),
+                    },
+                    {
+                        "block_key": 9231,
+                        "medium": "gpu",
+                        "specs": _make_single_spec(
+                            "gpu_0", baseline_gpu_uri
+                        ),
+                    },
+                ])],
+                trace_id="t23_baseline_snapshot",
+            )
+        )
+        version = baseline["committed_snapshot_version"]
+
+        updated_mem_uri = _build_event_report_uri(
+            host, "mem", {"source": "retry_update"}
+        )
+        added_disk_uri = _build_event_report_uri(
+            host, "disk", {"source": "retry_add"}
+        )
+        retry_events = [
+            _ev_block_add(
+                9230,
+                "mem",
+                _make_single_spec("linear_0", updated_mem_uri),
+            ),
+            _ev_block_add(
+                9232,
+                "disk",
+                _make_single_spec("full_3", added_disk_uri),
+            ),
+            _ev_block_delete(9231, "gpu", ["gpu_0"]),
+            _ev_heartbeat({"report_mode": "realtime"}),
+        ]
+        for attempt in range(2):
+            response = self.client.report_event(
+                _make_request(
+                    self.instance_id,
+                    host,
+                    retry_events,
+                    trace_id=f"t23_retry_{attempt}",
+                )
+            )
+            self.assertEqual(
+                response.get("committed_snapshot_version"), version
+            )
+
+        expected_after_retry = {
+            9230: {"linear_0": updated_mem_uri},
+            9231: {},
+            9232: {"full_3": added_disk_uri},
+        }
+        for block_key, expected_specs in expected_after_retry.items():
+            specs = _wait_for_block_spec_names(
+                self.client,
+                self.instance_id,
+                block_key,
+                set(expected_specs),
+                f"t23_query_retry_{block_key}",
+            )
+            for spec in specs:
+                _assert_reporter_scope(
+                    self,
+                    spec["uri"],
+                    expected_specs[spec["name"]],
+                    self.instance_id,
+                    host,
+                    "",
+                    version,
+                )
+
+        partial_add_uri = _build_event_report_uri(
+            host, "mem", {"source": "partial_valid"}
+        )
+        invalid_uri = _build_event_report_uri(
+            host, "mem", {"source": "partial_invalid"}
+        )
+        partial = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [
+                    _ev_block_add(
+                        9233,
+                        "mem",
+                        _make_single_spec("linear_0", partial_add_uri),
+                    ),
+                    _ev_block_add(
+                        9234,
+                        "mem",
+                        [
+                            {"name": "linear_0", "uri": invalid_uri},
+                            {"name": "linear_0", "uri": invalid_uri},
+                        ],
+                    ),
+                    _ev_block_delete(9232, "disk", ["full_3"]),
+                    _ev_heartbeat({"report_mode": "realtime"}),
+                ],
+                trace_id="t23_partial_batch",
+            ),
+            check_ok=False,
+        )
+        self.assertEqual(
+            partial["header"]["status"]["code"], "INVALID_ARGUMENT"
+        )
+        self.assertEqual(
+            partial.get("item_results"),
+            ["OK", "INVALID_ARGUMENT", "OK", "OK"],
+        )
+        self.assertEqual(
+            partial.get("committed_snapshot_version"), version
+        )
+        self.assertFalse(partial.get("snapshot_required"))
+
+        partial_specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            9233,
+            {"linear_0"},
+            "t23_query_partial_add",
+        )
+        _assert_reporter_scope(
+            self,
+            partial_specs[0]["uri"],
+            partial_add_uri,
+            self.instance_id,
+            host,
+            "mem",
+            version,
+        )
+        for block_key in (9232, 9234):
+            _wait_for_block_spec_names(
+                self.client,
+                self.instance_id,
+                block_key,
+                set(),
+                f"t23_query_partial_absent_{block_key}",
+            )
+
+        recovered = self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_heartbeat({"report_mode": "realtime"})],
+                trace_id="t23_after_partial_failure",
+            )
+        )
+        self.assertEqual(
+            recovered.get("committed_snapshot_version"), version
+        )
+        self.assertFalse(recovered.get("snapshot_required"))
 
 # ---------------------------------------------------------------------------
 # Bench tests
