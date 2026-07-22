@@ -642,6 +642,8 @@ Location、URI 与 token：
 
 - snapshot in flight 时，新 delta 阻塞，commit 后继承新 token；
 - snapshot in flight 时，新 delta 阻塞，abort 后继承旧 token；
+- delta 写入已开始后 snapshot 等待其完成，随后完整 snapshot 覆盖该增量；
+- snapshot 部分覆盖失败并 abort 后，新 delta 继续使用旧 token，下一次完整 snapshot 收敛；
 - active delta 未结束时 snapshot 先关闭新 delta 入口，再等待 active delta drain；
 - 第二个并发 snapshot 返回 `SNAPSHOT_IN_PROGRESS`；
 - 成功 snapshot 后 30 秒内返回 `SNAPSHOT_RATE_LIMITED`；
@@ -668,6 +670,8 @@ Reclaimer：
 - reporter 一次上报 HBM+Memory，响应返回 committed token；
 - 首次 snapshot、实时 ADD/DELETE/HEARTBEAT、下一轮 snapshot 对账和后续实时增量串成一条完整链路，
   每个阶段查询结果与 committed token 一致；
+- 6000-block 初始 snapshot 与 ADD/DELETE/HEARTBEAT 并发，竞争 snapshot 返回 busy，metadata mutation
+  在 commit 后继承新 token；16 个并发 ADD 更新同一 stable location 时不丢命名 spec；
 - 查询只看到本次完整 host snapshot；
 - 下一轮遗漏 block/medium 后立即不可见，随后由现有 reclaimer 删除；
 - snapshot 后 ADD/DELETE 继承 token；

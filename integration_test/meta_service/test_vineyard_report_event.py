@@ -1954,6 +1954,225 @@ class EventReportFunctionalTest(unittest.TestCase):
         )
         self.assertFalse(recovered.get("snapshot_required"))
 
+    def test_24_concurrent_snapshot_and_realtime_updates_converge(self):
+        host = "192.168.1.248:8080"
+        self.client.report_event(
+            _make_request(
+                self.instance_id,
+                host,
+                [_ev_node_register(["mem", "gpu"])],
+                trace_id="t24_register",
+            )
+        )
+
+        first_key = 9240
+        snapshot_block_count = 6000
+        snapshot_blocks = []
+        for offset in range(snapshot_block_count):
+            block_key = first_key + offset
+            snapshot_blocks.append({
+                "block_key": block_key,
+                "medium": "mem",
+                "specs": _make_single_spec(
+                    "linear_0",
+                    _build_event_report_uri(
+                        host, "mem", {"source": f"snapshot_{block_key}"}
+                    ),
+                ),
+            })
+        snapshot_request = _make_request(
+            self.instance_id,
+            host,
+            [_ev_block_snapshot(snapshot_blocks)],
+            trace_id="t24_large_initial_snapshot",
+        )
+
+        def send_with_fresh_client(payload, check_ok=True):
+            client = KVCMClient(BASE_URL, ADMIN_URL)
+            try:
+                return client.report_event(payload, check_ok=check_ok)
+            finally:
+                client.close()
+
+        with ThreadPoolExecutor(max_workers=24) as pool:
+            snapshot_future = pool.submit(
+                send_with_fresh_client, snapshot_request
+            )
+
+            # The large write keeps the full-snapshot gate observable through
+            # the real HTTP/service/manager stack.  A second snapshot must not
+            # enter the write path for the same reporter.
+            time.sleep(0.05)
+            busy = send_with_fresh_client(
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_block_snapshot([])],
+                    trace_id="t24_competing_snapshot",
+                ),
+                check_ok=False,
+            )
+            self.assertEqual(
+                busy["header"]["status"]["code"],
+                "SNAPSHOT_IN_PROGRESS",
+            )
+
+            delta_update_uri = _build_event_report_uri(
+                host, "mem", {"source": "delta_after_gate"}
+            )
+            delta_new_uri = _build_event_report_uri(
+                host, "gpu", {"source": "new_after_gate"}
+            )
+            gated_requests = [
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_block_add(
+                        first_key,
+                        "mem",
+                        _make_single_spec("linear_0", delta_update_uri),
+                    )],
+                    trace_id="t24_gated_update",
+                ),
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_block_delete(first_key + 1, "mem", ["linear_0"])],
+                    trace_id="t24_gated_delete",
+                ),
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_block_add(
+                        first_key + snapshot_block_count,
+                        "gpu",
+                        _make_single_spec("gpu_0", delta_new_uri),
+                    )],
+                    trace_id="t24_gated_new_block",
+                ),
+                _make_request(
+                    self.instance_id,
+                    host,
+                    [_ev_heartbeat({"report_mode": "concurrent"})],
+                    trace_id="t24_gated_heartbeat",
+                ),
+            ]
+            gated_futures = [
+                pool.submit(send_with_fresh_client, request)
+                for request in gated_requests
+            ]
+
+            snapshot_response = snapshot_future.result(timeout=20)
+            version = snapshot_response["committed_snapshot_version"]
+            self.assertEqual(len(version), 32)
+            for future in gated_futures[:3]:
+                response = future.result(timeout=10)
+                self.assertEqual(
+                    response.get("committed_snapshot_version"), version
+                )
+            heartbeat_response = gated_futures[3].result(timeout=10)
+            heartbeat_version = heartbeat_response.get(
+                "committed_snapshot_version", ""
+            )
+            self.assertIn(heartbeat_version, ("", version))
+            self.assertEqual(
+                heartbeat_response.get("snapshot_required"),
+                heartbeat_version == "",
+            )
+
+            # Concurrent deltas touching the same stable location must merge,
+            # not lose each other's named specs.
+            shared_key = first_key + 2
+            writer_count = 16
+            merge_futures = []
+            expected_names = {"linear_0"}
+            for writer in range(writer_count):
+                spec_name = f"concurrent_{writer}"
+                expected_names.add(spec_name)
+                uri = _build_event_report_uri(
+                    host, "mem", {"source": spec_name}
+                )
+                merge_futures.append(pool.submit(
+                    send_with_fresh_client,
+                    _make_request(
+                        self.instance_id,
+                        host,
+                        [_ev_block_add(
+                            shared_key,
+                            "mem",
+                            _make_single_spec(spec_name, uri),
+                        )],
+                        trace_id=f"t24_concurrent_delta_{writer}",
+                    ),
+                ))
+            for future in merge_futures:
+                response = future.result(timeout=10)
+                self.assertEqual(
+                    response.get("committed_snapshot_version"), version
+                )
+
+        updated_specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            first_key,
+            {"linear_0"},
+            "t24_query_gated_update",
+        )
+        _assert_reporter_scope(
+            self,
+            updated_specs[0]["uri"],
+            delta_update_uri,
+            self.instance_id,
+            host,
+            "mem",
+            version,
+        )
+        _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            first_key + 1,
+            set(),
+            "t24_query_gated_delete",
+        )
+        untouched_specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            first_key + 3,
+            {"linear_0"},
+            "t24_query_untouched_snapshot_block",
+        )
+        self.assertEqual(
+            _snapshot_version_from_uri(self, untouched_specs[0]["uri"]),
+            version,
+        )
+        new_specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            first_key + snapshot_block_count,
+            {"gpu_0"},
+            "t24_query_gated_new_block",
+        )
+        _assert_reporter_scope(
+            self,
+            new_specs[0]["uri"],
+            delta_new_uri,
+            self.instance_id,
+            host,
+            "gpu",
+            version,
+        )
+        merged_specs = _wait_for_block_spec_names(
+            self.client,
+            self.instance_id,
+            first_key + 2,
+            expected_names,
+            "t24_query_concurrent_delta_merge",
+        )
+        for spec in merged_specs:
+            self.assertEqual(
+                _snapshot_version_from_uri(self, spec["uri"]), version
+            )
+
 # ---------------------------------------------------------------------------
 # Bench tests
 # ---------------------------------------------------------------------------
@@ -2129,6 +2348,12 @@ def main():
     parser.add_argument("--skip-bench", action="store_true", help="Skip benchmark tests")
     parser.add_argument("--only-bench", action="store_true", help="Run only benchmark tests")
     parser.add_argument(
+        "--functional-test",
+        action="append",
+        default=[],
+        help="Run only the named EventReportFunctionalTest method; repeatable.",
+    )
+    parser.add_argument(
         "--enable-liveness-timing-tests",
         action="store_true",
         help=("Run heartbeat/cleanup timing tests. Requires the Event report storage to be opened with "
@@ -2162,9 +2387,12 @@ def main():
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
 
-    if not ONLY_BENCH:
+    if args.functional_test:
+        for test_name in args.functional_test:
+            suite.addTest(EventReportFunctionalTest(test_name))
+    elif not ONLY_BENCH:
         suite.addTests(loader.loadTestsFromTestCase(EventReportFunctionalTest))
-    if not SKIP_BENCH:
+    if not args.functional_test and not SKIP_BENCH:
         suite.addTests(loader.loadTestsFromTestCase(EventReportBenchTest))
 
     runner = unittest.TextTestRunner(verbosity=2)

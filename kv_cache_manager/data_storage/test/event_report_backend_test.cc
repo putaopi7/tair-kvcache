@@ -625,6 +625,119 @@ TEST(EventReportBackendSnapshotTest, CommitUnblocksAllWaitingDeltasWithNewToken)
     }
 }
 
+TEST(EventReportBackendSnapshotTest, SnapshotWaitsUntilEveryAdmittedDeltaDrains) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.1:8080"};
+
+    std::string first;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
+
+    constexpr size_t kActiveDeltaCount = 3;
+    for (size_t i = 0; i < kActiveDeltaCount; ++i) {
+        std::string committed;
+        ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, committed));
+        ASSERT_EQ(first, committed);
+    }
+
+    auto snapshot = std::async(std::launch::async, [&] {
+        std::string candidate;
+        uint64_t retry_ms = 0;
+        const ErrorCode ec = backend.BeginSnapshot(reporter_key, candidate, retry_ms);
+        return std::make_tuple(ec, candidate, retry_ms);
+    });
+    EXPECT_EQ(std::future_status::timeout, snapshot.wait_for(20ms));
+
+    backend.EndDeltaMutation(reporter_key);
+    EXPECT_EQ(std::future_status::timeout, snapshot.wait_for(20ms));
+    backend.EndDeltaMutation(reporter_key);
+    EXPECT_EQ(std::future_status::timeout, snapshot.wait_for(20ms));
+    backend.EndDeltaMutation(reporter_key);
+
+    ASSERT_EQ(std::future_status::ready, snapshot.wait_for(1s));
+    const auto [ec, candidate, retry_ms] = snapshot.get();
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_TRUE(IsValidSnapshotVersionToken(candidate));
+    EXPECT_EQ(0u, retry_ms);
+    EXPECT_TRUE(backend.CommitSnapshotVersion(reporter_key, candidate));
+}
+
+TEST(EventReportBackendSnapshotTest, ConcurrentSnapshotsHaveExactlyOneWinner) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.1:8080"};
+    constexpr size_t kContenderCount = 12;
+
+    std::promise<void> start;
+    auto start_signal = start.get_future().share();
+    std::vector<std::future<std::pair<ErrorCode, std::string>>> contenders;
+    contenders.reserve(kContenderCount);
+    for (size_t i = 0; i < kContenderCount; ++i) {
+        contenders.push_back(std::async(std::launch::async, [&] {
+            start_signal.wait();
+            std::string candidate;
+            uint64_t retry_after_ms = 0;
+            const ErrorCode ec = backend.BeginSnapshot(reporter_key, candidate, retry_after_ms);
+            return std::make_pair(ec, candidate);
+        }));
+    }
+    start.set_value();
+
+    size_t winner_count = 0;
+    size_t busy_count = 0;
+    std::string winning_token;
+    for (auto &contender : contenders) {
+        ASSERT_EQ(std::future_status::ready, contender.wait_for(1s));
+        const auto [ec, candidate] = contender.get();
+        if (ec == EC_OK) {
+            ++winner_count;
+            winning_token = candidate;
+        } else {
+            EXPECT_EQ(EC_SNAPSHOT_IN_PROGRESS, ec);
+            EXPECT_TRUE(candidate.empty());
+            ++busy_count;
+        }
+    }
+    EXPECT_EQ(1u, winner_count);
+    EXPECT_EQ(kContenderCount - 1, busy_count);
+    ASSERT_TRUE(IsValidSnapshotVersionToken(winning_token));
+    EXPECT_TRUE(backend.CommitSnapshotVersion(reporter_key, winning_token));
+}
+
+TEST(EventReportBackendSnapshotTest, UnregisterCancelsSnapshotWaitingForActiveDelta) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const std::string instance_id = "instance-a";
+    const std::string host = "10.0.0.1:8080";
+    const ReporterSnapshotKey reporter_key{instance_id, host};
+    ASSERT_EQ(EC_OK, backend.RegisterNode(instance_id, host, {"hbm"}));
+
+    std::string first;
+    uint64_t retry_after_ms = 0;
+    ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, first, retry_after_ms));
+    ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, first));
+    std::string committed;
+    ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(reporter_key, committed));
+
+    auto snapshot = std::async(std::launch::async, [&] {
+        std::string candidate = "stale";
+        uint64_t retry_ms = 99;
+        const ErrorCode ec = backend.BeginSnapshot(reporter_key, candidate, retry_ms);
+        return std::make_tuple(ec, candidate, retry_ms);
+    });
+    EXPECT_EQ(std::future_status::timeout, snapshot.wait_for(20ms));
+    ASSERT_EQ(EC_OK, backend.UnregisterNode(instance_id, host));
+
+    ASSERT_EQ(std::future_status::ready, snapshot.wait_for(1s));
+    const auto [ec, candidate, retry_ms] = snapshot.get();
+    EXPECT_EQ(EC_SNAPSHOT_REQUIRED, ec);
+    EXPECT_TRUE(candidate.empty());
+    EXPECT_EQ(0u, retry_ms);
+    backend.EndDeltaMutation(reporter_key);
+}
+
 TEST(EventReportBackendSnapshotTest, UnregisterUnblocksWaitingDeltaAndRequiresNewSnapshot) {
     EventReportBackend backend(nullptr);
     backend.SetSnapshotMinIntervalMsForTest(0);

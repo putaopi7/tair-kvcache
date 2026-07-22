@@ -1,8 +1,10 @@
 #include <filesystem>
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
+#include <thread>
 #include <tuple>
 
 #include "kv_cache_manager/common/request_context.h"
@@ -315,6 +317,102 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsKeepsOnlyCurrentSnapshotVers
     ASSERT_EQ(2u, specs.size());
     EXPECT_EQ(uri("newer_linear", version_b), specs["linear_0"]);
     EXPECT_EQ(uri("new_mamba", version_b), specs["mamba_1"]);
+}
+
+TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltasDoNotLoseUpdates) {
+    const int64_t key = 10011;
+    const std::string location_id = "kvs#event_report#mem#127.0.0.1:8080";
+    constexpr size_t kSnapshotContenders = 12;
+
+    std::promise<void> replace_start;
+    auto replace_signal = replace_start.get_future().share();
+    std::vector<std::future<std::pair<ErrorCode, std::vector<ErrorCode>>>> replace_futures;
+    replace_futures.reserve(kSnapshotContenders);
+    for (size_t i = 0; i < kSnapshotContenders; ++i) {
+        replace_futures.push_back(std::async(std::launch::async, [&, i] {
+            replace_signal.wait();
+            const std::string generation = std::to_string(i);
+            const std::string token = std::string(31, '0') + "0123456789ab"[i];
+            const std::string uri_prefix =
+                "event_report://127.0.0.1:8080/mem?generation=" + generation + "&s_version=" + token;
+            std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> tasks = {{
+                {location_id,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 CacheLocationStatus::CLS_SERVING,
+                 {LocationSpec("tp0", uri_prefix), LocationSpec("tp1", uri_prefix)}},
+            }};
+            std::vector<ErrorCode> per_key_ec;
+            RequestContext context("concurrent_replace_" + generation);
+            const ErrorCode ec = meta_searcher_->BatchReplaceLocationSpecs(&context, {key}, tasks, per_key_ec);
+            return std::make_pair(ec, per_key_ec);
+        }));
+    }
+    replace_start.set_value();
+    for (auto &future : replace_futures) {
+        ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(2)));
+        const auto [ec, per_key_ec] = future.get();
+        EXPECT_EQ(EC_OK, ec);
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    }
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(1u, location_maps[0].size());
+    const auto &replaced_specs = location_maps[0].at(location_id)->location_specs();
+    ASSERT_EQ(2u, replaced_specs.size());
+    SnapshotUriInfo first_info;
+    SnapshotUriInfo second_info;
+    ASSERT_TRUE(ParseSnapshotUriInfo(replaced_specs[0].uri(), first_info));
+    ASSERT_TRUE(ParseSnapshotUriInfo(replaced_specs[1].uri(), second_info));
+    EXPECT_EQ(first_info.version, second_info.version);
+    const auto first_generation = DataStorageUri(replaced_specs[0].uri()).GetParam("generation");
+    const auto second_generation = DataStorageUri(replaced_specs[1].uri()).GetParam("generation");
+    EXPECT_EQ(first_generation, second_generation);
+
+    constexpr size_t kDeltaWriters = 8;
+    std::promise<void> merge_start;
+    auto merge_signal = merge_start.get_future().share();
+    std::vector<std::future<std::pair<ErrorCode, std::vector<ErrorCode>>>> merge_futures;
+    merge_futures.reserve(kDeltaWriters);
+    for (size_t i = 0; i < kDeltaWriters; ++i) {
+        merge_futures.push_back(std::async(std::launch::async, [&, i] {
+            merge_signal.wait();
+            const std::string index = std::to_string(i);
+            const std::string uri = "event_report://127.0.0.1:8080/mem?delta=" + index +
+                                    "&s_version=" + first_info.version;
+            std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
+                {location_id,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 CacheLocationStatus::CLS_SERVING,
+                 {LocationSpec("delta_" + index, uri)}},
+            }};
+            std::vector<ErrorCode> per_key_ec;
+            RequestContext context("concurrent_merge_" + index);
+            const ErrorCode ec = meta_searcher_->BatchMergeLocationSpecs(&context, {key}, tasks, per_key_ec);
+            return std::make_pair(ec, per_key_ec);
+        }));
+    }
+    merge_start.set_value();
+    for (auto &future : merge_futures) {
+        ASSERT_EQ(std::future_status::ready, future.wait_for(std::chrono::seconds(2)));
+        const auto [ec, per_key_ec] = future.get();
+        EXPECT_EQ(EC_OK, ec);
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), per_key_ec);
+    }
+
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    const auto &merged_specs = location_maps[0].at(location_id)->location_specs();
+    ASSERT_EQ(2u + kDeltaWriters, merged_specs.size());
+    std::set<std::string> names;
+    for (const auto &spec : merged_specs) {
+        SnapshotUriInfo info;
+        ASSERT_TRUE(ParseSnapshotUriInfo(spec.uri(), info));
+        EXPECT_EQ(first_info.version, info.version);
+        names.insert(spec.name());
+    }
+    EXPECT_EQ(2u + kDeltaWriters, names.size());
 }
 
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsCreatesLocationWithMultipleSpecs) {
