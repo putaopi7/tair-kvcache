@@ -12,15 +12,24 @@ ReportEvent 使用两条互补链路同步 KV Cache 元数据：
 
 Snapshot 是一个 reporter 在某一时刻、跨全部介质的完整 cache 事实，不是增量补丁，也不是历史版本存档。
 
-本方案的核心结论：
+### 1.1 核心设计原则
 
-1. snapshot scope 只有 `instance_id + reporter host_ip_port`；
-2. `medium` 是 block 属性，一台机器的 GPU/CPU/Disk 在一个 snapshot 中一起上报；
-3. location id 保持稳定，不使用 copy-on-write location；
-4. URI 只追加一个 `s_version`，查询只接受当前内存 committed version；
-5. committed version 不持久化，通过响应返回给 Subscriber；
-6. commit 后复用现有 reclaimer 任务机制删除旧数据；
-7. 接受“写到一半失败，部分旧数据暂时不可见，等待下次完整 snapshot 修复”的语义。
+1. **增量负责效率，快照负责收敛。** ADD/DELETE 优化稳态写放大，snapshot 则是能够覆盖
+   增量历史的权威事实；系统正确性不能永久依赖每一条增量事件都不丢失。
+2. **一致性边界跟随权威写入者。** 一个 reporter 独占维护某个 instance 在本机上的全部
+   cache 状态，因此版本、互斥栅栏、限频和失效都以该写入者为单位；存储介质只是这份
+   状态内部的属性，不是独立的一致性域。
+3. **可见性由提交版本决定，而不是由物理写入完成度决定。** KVCM 先把新版本写入 URI，
+   全部写入成功后才发布 committed token；查询只接受 token 匹配的数据，旧数据或失败
+   写入留下的数据都不可被误认为当前事实。
+4. **逻辑版本与物理位置解耦。** location id 保持稳定，版本只承载可见性，不制造一套
+   新的物理 location identity。这样避免 copy-on-write 的双份位置和两阶段替换，同时
+   明确接受缓存场景下“失败后等待下次 snapshot 收敛”的可用性取舍。
+5. **查询正确性不依赖清理及时性。** 版本过滤先保证旧数据不可见，reclaimer 只负责
+   异步回收空间；清理延迟或 KVCM 在清理中重启都不能重新暴露旧版本。
+6. **重启恢复依赖源端重建事实。** committed token 只保存在内存并通过响应反馈给
+   Subscriber。KVCM 重启后所有 reporter 必须重新提交完整 snapshot，不从残留 metadata
+   猜测或恢复旧的权威状态。
 
 ## 2. 要解决的问题
 
@@ -66,24 +75,67 @@ Engine 的 cache version、event sequence 或 epoch 与本文的 KVCM snapshot v
 - source watermark 证明 Engine 快照与后续事件的先后关系；
 - KVCM snapshot version 标识哪一轮 metadata 对账已经提交。
 
-## 4. Scope：只有 instance + reporter
+## 4. Scope 的推导：以权威写入者为一致性边界
+
+### 4.1 先确定谁对数据负责
+
+Snapshot 要回答的不是“某种介质上有哪些 block”，而是：
+
+> 某个 cache reporter 此刻声明自己负责的完整 cache 集合是什么？
+
+在当前部署模型中，一个 Subscriber/reporter 统一观察同一 instance 在一台推理节点上的
+GPU、CPU 和 Disk cache，并负责把这台节点的变化按序上报给 KVCM。它是这组 metadata
+的唯一权威写入者，也是发生重启、断连、HOST_DOWN 和重新注册的生命周期单元。
+
+因此，一致性 scope 定义为：
 
 ```text
 snapshot scope = instance_id + reporter host_ip_port
 ```
 
-`medium` 不属于 scope，不参与：
+两个字段分别解决不同的隔离问题：
+
+- `instance_id` 隔离不同模型实例或 cache namespace；
+- `reporter host_ip_port` 标识该 instance 下独立的写入者和故障域。
+
+这里的 `host_ip_port` 是 reporter identity，不只是物理机器地址。设计要求同一 scope 同时
+只能有一个活跃写入者；如果未来同一节点允许多个进程独立拥有 cache，必须为它们分配
+不同的 reporter identity，或显式扩展 scope，不能让多个写入者共用一个 token。
+
+### 4.2 为什么 medium 不属于 scope
+
+`medium` 决定 block 位于 HBM、DRAM 还是 Disk，是数据的寻址和放置属性，但它不是独立
+的写入者、故障域或生命周期单元。同一个 reporter 能在同一时刻观察全部介质，所以一份
+host snapshot 应当同时声明全部介质的事实。
+
+如果把 `medium` 放进 scope，会产生并不需要的中间状态：例如 HBM 已提交 v2、DRAM 仍停
+留在 v1，查询看到的是同一 reporter 不同时刻的拼接结果；Subscriber 还必须分别维护多套
+token、重试和栅栏。对当前单 reporter 架构而言，这既没有增加真实性，也削弱了“完整
+host snapshot”的含义。
+
+所以 `medium` 只保留在 `BlockSnapshotItem` 和 stable location id 中，不参与：
 
 - committed version 状态；
 - snapshot 频率限制；
 - snapshot/delta 并发栅栏；
-- scope 隔离和恢复。
+- scope 生命周期和失效。
 
-同一 reporter 管理的 GPU、CPU、Disk 等缓存必须在一次 snapshot 请求中一起上报，并共享同一个 committed version。
+### 4.3 Scope 带来的协议约束
 
-不同 instance 或不同 reporter 相互隔离，可以并行处理。
+由上述所有权边界直接得到以下约束：
 
-`host_ip_port` 必须取自 `ReportEventRequest.host_ip_port`。数据 URI 的 host 可能是物理存储服务地址，不能代替 reporter 身份。
+- 同一 scope 的 GPU、CPU、Disk 必须在一个 snapshot 中完整上报并共享同一个 committed
+  token；空 `blocks` 表示该 reporter 的全部介质均为空。
+- 同一 scope 内 snapshot 与 delta 必须互斥，避免 snapshot 基线与其间增量互相覆盖；
+  不同 scope 没有共同写入者，可以并行执行。
+- REGISTER 只刷新已有 reporter 的存活状态，不重置 token；HOST_DOWN、显式注销或 KVCM
+  重启会使 scope 的 committed token 失效，重新注册后必须先完成新 snapshot。
+- 限频按 scope 执行，防止单个异常 reporter 影响其他节点。
+- location id 仍包含 `medium`，因为查询和清理需要定位物理介质；这与版本 scope 是否包含
+  `medium` 是两个不同问题。
+
+`host_ip_port` 必须取自 `ReportEventRequest.host_ip_port`。数据 URI 的 host 可能是实际
+存储服务地址，不能替代 reporter identity。
 
 ## 5. Snapshot 协议
 
