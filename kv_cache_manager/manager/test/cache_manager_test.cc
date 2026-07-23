@@ -98,34 +98,6 @@ private:
     MightExistFunc fn_;
 };
 
-class SnapshotFaultInjectingMetaLocalBackend : public MetaLocalBackend {
-public:
-    void FailNextAllocatedMarker() { fail_next_allocated_marker_ = true; }
-    void FailNextCommittedMarker() { fail_next_committed_marker_ = true; }
-    void FailNextSync() { fail_next_sync_ = true; }
-
-    ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override {
-        for (const auto &[field, value] : field_maps) {
-            (void)value;
-        }
-        return MetaLocalBackend::PutMetaData(field_maps);
-    }
-
-    bool Sync(const KeyTypeVec & /*keys*/) noexcept override {
-        if (fail_next_sync_) {
-            fail_next_sync_ = false;
-            return false;
-        }
-        // MetaLocalBackend writes synchronously.
-        return true;
-    }
-
-private:
-    bool fail_next_allocated_marker_ = false;
-    bool fail_next_committed_marker_ = false;
-    bool fail_next_sync_ = false;
-};
-
 // A deterministic write gate for ReportEvent ordering tests.  Sleeping in a
 // test cannot prove which request acquired the snapshot fence first; blocking
 // the persistent Upsert lets the test observe and release that exact point.
@@ -385,6 +357,31 @@ public:
                 if (spec.uri().rfind("event_report://", 0) == 0) {
                     uris.push_back(spec.uri());
                 }
+            }
+        }
+        return uris;
+    }
+
+    std::vector<std::string> QueryRawEventReportUris(int64_t key) {
+        MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        if (!meta_searcher) {
+            return {};
+        }
+        RequestContext context("query_raw_report_event");
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask;
+        const ErrorCode ec = meta_searcher->BatchGetLocation(&context, {key}, mask, location_maps);
+        if ((ec != EC_OK && ec != EC_PARTIAL_OK) || location_maps.empty()) {
+            return {};
+        }
+        std::vector<std::string> uris;
+        for (const auto &[location_id, location] : location_maps.front()) {
+            (void)location_id;
+            if (!location || location->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
+                continue;
+            }
+            for (const auto &spec : location->location_specs()) {
+                uris.push_back(spec.uri());
             }
         }
         return uris;
@@ -2314,6 +2311,71 @@ TEST_F(CacheManagerTest, TestReportEventPartialSnapshotFailureIsFailClosedAndRet
         }
     }
     EXPECT_EQ((std::set<std::string>{"retry_a", "retry_b"}), retry_sources);
+}
+
+TEST_F(CacheManagerTest, TestReportEventSnapshotCommitReclaimsOnlyStaleReporterLocations) {
+    const std::string host_a = "192.168.10.4:8080";
+    const std::string host_b = "192.168.10.5:8080";
+    const int64_t stale_key = 9430;
+    const int64_t current_key = 9431;
+    const int64_t other_host_key = 9432;
+    auto event_backend = InstallEventReportBackend();
+    ASSERT_NE(nullptr, event_backend);
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host_a, {"mem"}));
+    ASSERT_EQ(EC_OK, event_backend->RegisterNode("test_instance", host_b, {"mem"}));
+
+    const auto [host_a_baseline_ec, host_a_baseline] = CallReportEvent(
+        MakeSnapshotRequest(host_a, {{stale_key, "host_a_stale"}, {current_key, "host_a_old_current"}}),
+        "reclaimer_host_a_baseline");
+    ASSERT_EQ(EC_OK, host_a_baseline_ec);
+    const std::string host_a_old_token = host_a_baseline.committed_snapshot_version();
+
+    const auto [host_b_baseline_ec, host_b_baseline] =
+        CallReportEvent(MakeSnapshotRequest(host_b, {{other_host_key, "host_b_current"}}), "reclaimer_host_b_baseline");
+    ASSERT_EQ(EC_OK, host_b_baseline_ec);
+    const std::string host_b_token = host_b_baseline.committed_snapshot_version();
+    ASSERT_NE(host_a_old_token, host_b_token);
+
+    ASSERT_EQ(1u, QueryRawEventReportUris(stale_key).size());
+    ASSERT_EQ(1u, QueryRawEventReportUris(current_key).size());
+    ASSERT_EQ(1u, QueryRawEventReportUris(other_host_key).size());
+
+    const auto [reconcile_ec, reconcile] = CallReportEvent(
+        MakeSnapshotRequest(host_a, {{current_key, "host_a_new_current"}}), "reclaimer_host_a_reconcile");
+    ASSERT_EQ(EC_OK, reconcile_ec);
+    const std::string host_a_new_token = reconcile.committed_snapshot_version();
+    ASSERT_NE(host_a_old_token, host_a_new_token);
+
+    // Query filtering must hide the omitted block immediately, before making
+    // any assumption about asynchronous physical reclamation.
+    EXPECT_TRUE(QueryEventReportUris({stale_key}).empty());
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline && !QueryRawEventReportUris(stale_key).empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(QueryRawEventReportUris(stale_key).empty());
+
+    // The same cleanup scan must preserve the reporter's current token and
+    // every location belonging to a different reporter.
+    const auto current_uris = QueryRawEventReportUris(current_key);
+    ASSERT_EQ(1u, current_uris.size());
+    EXPECT_NE(std::string::npos, current_uris.front().find("source=host_a_new_current"));
+    EXPECT_NE(std::string::npos, current_uris.front().find("s_version=" + host_a_new_token));
+    const auto other_host_uris = QueryRawEventReportUris(other_host_key);
+    ASSERT_EQ(1u, other_host_uris.size());
+    EXPECT_NE(std::string::npos, other_host_uris.front().find("source=host_b_current"));
+    EXPECT_NE(std::string::npos, other_host_uris.front().find("s_version=" + host_b_token));
+
+    // Re-scanning after the stale location has already gone is idempotent.
+    EXPECT_EQ(EC_OK,
+              cache_manager_->CleanupStaleSnapshotLocations({"test_instance", host_a},
+                                                             host_a_new_token,
+                                                             DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                                                             event_backend));
+    EXPECT_TRUE(QueryRawEventReportUris(stale_key).empty());
+    EXPECT_EQ(1u, QueryRawEventReportUris(current_key).size());
+    EXPECT_EQ(1u, QueryRawEventReportUris(other_host_key).size());
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportFallbackLookup) {

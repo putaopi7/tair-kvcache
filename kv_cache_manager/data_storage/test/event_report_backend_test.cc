@@ -2,6 +2,7 @@
 #include <future>
 #include <gtest/gtest.h>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -485,6 +486,27 @@ TEST(EventReportBackendSnapshotTest, SnapshotCommitPublishesOpaqueToken) {
     ASSERT_EQ(EC_OK, backend.BeginDeltaMutation(scope, committed));
     EXPECT_EQ(candidate, committed);
     backend.EndDeltaMutation(scope);
+}
+
+TEST(EventReportBackendSnapshotTest, SnapshotTokensAreNeverReusedAcrossAttempts) {
+    EventReportBackend backend(nullptr);
+    backend.SetSnapshotMinIntervalMsForTest(0);
+    const ReporterSnapshotKey reporter_key{"instance-a", "10.0.0.1:8080"};
+    std::set<std::string> observed;
+
+    for (size_t attempt = 0; attempt < 128; ++attempt) {
+        std::string candidate;
+        uint64_t retry_after_ms = 0;
+        ASSERT_EQ(EC_OK, backend.BeginSnapshot(reporter_key, candidate, retry_after_ms));
+        ASSERT_TRUE(IsValidSnapshotVersionToken(candidate));
+        EXPECT_TRUE(observed.insert(candidate).second);
+        if (attempt % 2 == 0) {
+            ASSERT_TRUE(backend.CommitSnapshotVersion(reporter_key, candidate));
+        } else {
+            backend.AbortSnapshotVersion(reporter_key, candidate);
+        }
+    }
+    EXPECT_EQ(128u, observed.size());
 }
 
 TEST(EventReportBackendSnapshotTest, SnapshotAndDeltaWaitForEachOther) {
