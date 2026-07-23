@@ -125,7 +125,7 @@ message BlockSnapshotEventParams {
 {
   "instance_id": "model-a",
   "host_ip_port": "10.0.0.8:9000",
-  "storage_type": "ST_EVENT_REPORT",
+  "storage_type": "ST_EVENT_REPORT_L2",
   "events": [
     {
       "event_type": "EVENT_BLOCK_SNAPSHOT",
@@ -182,14 +182,14 @@ message BlockSnapshotEventParams {
 location 仍按 block 的 medium 区分：
 
 ```text
-kvs#event_report#<medium>#<reporter host_ip_port>
+kvs#<event_report_type>#<medium>#<reporter host_ip_port>
 ```
 
 例如：
 
 ```text
-kvs#event_report#hbm#10.0.0.8:9000
-kvs#event_report#mem#10.0.0.8:9000
+kvs#event_report_l2#hbm#10.0.0.8:9000
+kvs#event_report_l2#mem#10.0.0.8:9000
 ```
 
 v1 更新到 v2 时，直接覆盖同一个 block 下该 stable location 的完整 specs。
@@ -197,7 +197,7 @@ v1 更新到 v2 时，直接覆盖同一个 block 下该 stable location 的完�
 明确删除下面的 copy-on-write 形式：
 
 ```text
-kvs#event_report#<medium>#snapshot_v=<version>#<reporter host_ip_port>
+kvs#<event_report_type>#<medium>#snapshot_v=<version>#<reporter host_ip_port>
 ```
 
 实现中不再需要：

@@ -149,7 +149,7 @@ curl -g -vvv -X POST http://localhost:6382/api/reportEvent \
     "trace_id": "trace_id_131",
     "instance_id": "test_instance",
     "host_ip_port": "192.168.2.1:8080",
-    "storage_type": "ST_EVENT_REPORT",
+    "storage_type": "ST_EVENT_REPORT_L2",
     "events": [
       {
         "event_type": "EVENT_BLOCK_SNAPSHOT",

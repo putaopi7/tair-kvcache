@@ -292,7 +292,7 @@ void BuildHostSpecNamesForOneKey(const CacheLocationMap &location_map,
         }
         std::string event_medium;
         std::string reporter_host;
-        const bool has_reporter_identity = loc->type() == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT &&
+        const bool has_reporter_identity = IsEventReportStorageType(loc->type()) &&
                                            ParseEventReportLocationId(kv.first, event_medium, reporter_host);
         for (const auto &spec : loc->location_specs()) {
             StandardUri uri(spec.uri());

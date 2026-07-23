@@ -64,12 +64,23 @@ TEST_F(EventReportBackendTest, BasicAccessors) {
 TEST_F(EventReportBackendTest, BuildLocationIdIncludesEventReportType) {
     EventReportBackend l1p5_backend(metrics_registry_);
     ASSERT_EQ(EC_OK, l1p5_backend.Open(MakeConfig(), "trace"));
-    EXPECT_EQ("kvs#event_report_l1p5#mem#10.0.0.1:8080", l1p5_backend.BuildLocationId("mem", "10.0.0.1:8080"));
+    const std::string l1p5_location = l1p5_backend.BuildLocationId("mem", "10.0.0.1:8080");
+    EXPECT_EQ("kvs#event_report_l1p5#mem#10.0.0.1:8080", l1p5_location);
 
     EventReportBackend l2_backend(metrics_registry_);
     ASSERT_EQ(EC_OK,
               l2_backend.Open(MakeConfig(200, 400, 50, DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2), "trace"));
-    EXPECT_EQ("kvs#event_report_l2#mem#10.0.0.1:8080", l2_backend.BuildLocationId("mem", "10.0.0.1:8080"));
+    const std::string l2_location = l2_backend.BuildLocationId("mem", "10.0.0.1:8080");
+    EXPECT_EQ("kvs#event_report_l2#mem#10.0.0.1:8080", l2_location);
+
+    std::string medium;
+    std::string host;
+    EXPECT_TRUE(l1p5_backend.ParseLocationId(l1p5_location, medium, host));
+    EXPECT_EQ("mem", medium);
+    EXPECT_EQ("10.0.0.1:8080", host);
+    EXPECT_FALSE(l1p5_backend.ParseLocationId(l2_location, medium, host));
+    EXPECT_TRUE(l2_backend.ParseLocationId(l2_location, medium, host));
+    EXPECT_FALSE(l2_backend.ParseLocationId(l1p5_location, medium, host));
 }
 
 TEST_F(EventReportBackendTest, OpenWithWrongSpecTypeFails) {
@@ -947,8 +958,9 @@ TEST(EventReportBackendSnapshotTest, UnregisterThenReregisterRequiresNewSnapshot
 
 TEST(EventReportBackendSnapshotTest, StableLocationIdHasNoSnapshotGeneration) {
     EventReportBackend backend(nullptr);
+    ASSERT_EQ(EC_OK, backend.Open(EventReportBackendTest::MakeConfig(), "snapshot_location_test"));
     const std::string location_id = backend.BuildLocationId("hbm", "10.0.0.1:8080");
-    EXPECT_EQ("kvs#event_report#hbm#10.0.0.1:8080", location_id);
+    EXPECT_EQ("kvs#event_report_l1p5#hbm#10.0.0.1:8080", location_id);
 
     std::string medium;
     std::string host;
@@ -1012,6 +1024,7 @@ TEST(EventReportBackendSnapshotTest, InvalidInputsDoNotMutateOrReleaseSnapshotSt
 
 TEST(EventReportBackendSnapshotTest, LocationIdParserRejectsMalformedAndLegacyIds) {
     EventReportBackend backend(nullptr);
+    ASSERT_EQ(EC_OK, backend.Open(EventReportBackendTest::MakeConfig(), "snapshot_parser_test"));
     std::string medium;
     std::string host;
 

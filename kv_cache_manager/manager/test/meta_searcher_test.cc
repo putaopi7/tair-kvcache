@@ -272,7 +272,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsAppendsAndOverwrites) {
 
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsKeepsOnlyCurrentSnapshotVersion) {
     const MetaSearcher::KeyVector keys = {10007};
-    const std::string location_id = "kvs#event_report#mem#127.0.0.1:8080";
+    const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
     const std::string version_a = "00112233445566778899aabbccddeeff";
     const std::string version_b = "ffeeddccbbaa99887766554433221100";
     auto uri = [](const std::string &source, const std::string &version) {
@@ -282,7 +282,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsKeepsOnlyCurrentSnapshotVers
     std::vector<ErrorCode> per_key_ec;
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
         {location_id,
-         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", uri("old_linear", version_a)),
           LocationSpec("mamba_0", uri("old_mamba", version_a)),
@@ -321,7 +321,7 @@ TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsKeepsOnlyCurrentSnapshotVers
 
 TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltasDoNotLoseUpdates) {
     const int64_t key = 10011;
-    const std::string location_id = "kvs#event_report#mem#127.0.0.1:8080";
+    const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
     constexpr size_t kSnapshotContenders = 12;
 
     std::promise<void> replace_start;
@@ -337,7 +337,7 @@ TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltas
                 "event_report://127.0.0.1:8080/mem?generation=" + generation + "&s_version=" + token;
             std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> tasks = {{
                 {location_id,
-                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CacheLocationStatus::CLS_SERVING,
                  {LocationSpec("tp0", uri_prefix), LocationSpec("tp1", uri_prefix)}},
             }};
@@ -384,7 +384,7 @@ TEST_F(MetaSearcherTest, TestConcurrentSnapshotReplaceIsAtomicAndSameTokenDeltas
                                     "&s_version=" + first_info.version;
             std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {{
                 {location_id,
-                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CacheLocationStatus::CLS_SERVING,
                  {LocationSpec("delta_" + index, uri)}},
             }};
@@ -448,35 +448,35 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     std::vector<ErrorCode> per_key_ec;
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {{
         {location_id,
-         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem?size=10")}},
     }};
 
     ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
-    EXPECT_EQ(10u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+    EXPECT_EQ(10u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
     // An at-least-once retry overwrites the same named spec and must not count
     // the bytes twice.
     ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
-    EXPECT_EQ(10u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+    EXPECT_EQ(10u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
     merge_tasks[0][0].specs.emplace_back("full_3", "event_report://127.0.0.1:8080/mem?size=5");
     ASSERT_EQ(EC_OK, meta_searcher_->BatchMergeLocationSpecs(request_context_.get(), keys, merge_tasks, per_key_ec));
-    EXPECT_EQ(15u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+    EXPECT_EQ(15u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
     std::vector<std::vector<MetaSearcher::ReplaceLocationSpecsTask>> replace_tasks = {{
         {location_id,
-         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem?size=7")}},
     }};
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
-    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
-    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
 
     // A location id has stable storage ownership.  Rejecting a type mutation
     // must leave both the stored location and per-type accounting unchanged.
@@ -484,7 +484,7 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     EXPECT_EQ(EC_OK,
               meta_searcher_->BatchReplaceLocationSpecs(request_context_.get(), keys, replace_tasks, per_key_ec));
     ASSERT_EQ((std::vector<ErrorCode>{EC_BADARGS}), per_key_ec);
-    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT));
+    EXPECT_EQ(7u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
     EXPECT_EQ(0u, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
 
     std::vector<CacheLocationMap> location_maps;
@@ -492,7 +492,7 @@ TEST_F(MetaSearcherTest, TestMergeAndReplaceLocationSpecsKeepStorageUsageExact) 
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, location_maps));
     ASSERT_EQ(1u, location_maps.size());
     ASSERT_EQ(1u, location_maps.front().size());
-    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, location_maps.front().at(location_id)->type());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, location_maps.front().at(location_id)->type());
 }
 TEST_F(MetaSearcherTest, TestBatchMergeLocationSpecsContinuesMergeAfterPartialBlockFailure) {
     auto faulty_backend = ReplaceWithFaultyBackend();
@@ -606,11 +606,11 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsPartialDelete) {
 
 TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsIsIdempotentForMissingData) {
     const MetaSearcher::KeyVector keys = {10008};
-    const std::string location_id = "kvs#event_report#mem#127.0.0.1:8080";
+    const std::string location_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
     std::vector<ErrorCode> per_key_ec;
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> merge_tasks = {{
         {location_id,
-         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+         DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
          CacheLocationStatus::CLS_SERVING,
          {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem")}},
     }};
@@ -625,7 +625,7 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsIsIdempotentForMissingData)
         meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), delete_results[0]);
 
-    delete_tasks = {{{"kvs#event_report#disk#127.0.0.1:8080", {"linear_0"}}}};
+    delete_tasks = {{{"kvs#event_report_l2#disk#127.0.0.1:8080", {"linear_0"}}}};
     ASSERT_EQ(
         EC_OK,
         meta_searcher_->BatchDeleteLocationSpecs(request_context_.get(), keys, delete_tasks, delete_results));
@@ -643,15 +643,15 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocationSpecsIsIdempotentForMissingData)
 
 TEST_F(MetaSearcherTest, TestCleanupLocationsByPredicateSubmitsExactObservedValue) {
     const MetaSearcher::KeyVector keys = {10009, 10010};
-    const std::string stale_id = "kvs#event_report#mem#127.0.0.1:8080";
-    const std::string current_id = "kvs#event_report#mem#127.0.0.2:8080";
+    const std::string stale_id = "kvs#event_report_l2#mem#127.0.0.1:8080";
+    const std::string current_id = "kvs#event_report_l2#mem#127.0.0.2:8080";
     std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> tasks = {
         {{stale_id,
-          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
           CacheLocationStatus::CLS_SERVING,
           {LocationSpec("linear_0", "event_report://127.0.0.1:8080/mem")}}},
         {{current_id,
-          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+          DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
           CacheLocationStatus::CLS_SERVING,
           {LocationSpec("linear_0", "event_report://127.0.0.2:8080/mem")}}},
     };
@@ -679,7 +679,7 @@ TEST_F(MetaSearcherTest, TestCleanupLocationsByPredicateSubmitsExactObservedValu
         EC_OK,
         cleanup_searcher.CleanupLocationsByPredicate(
             request_context_.get(),
-            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
             1,
             [&stale_id](int64_t, const std::string &location_id, const CacheLocation &) {
                 return location_id == stale_id;
@@ -695,7 +695,7 @@ TEST_F(MetaSearcherTest, TestCleanupLocationsByPredicateSubmitsExactObservedValu
         EC_OK,
         cleanup_searcher.CleanupLocationsByPredicate(
             request_context_.get(),
-            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
+            DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
             1,
             [&predicate_called](int64_t, const std::string &, const CacheLocation &) {
                 predicate_called = true;
@@ -1780,40 +1780,40 @@ protected:
         std::vector<std::vector<MetaSearcher::MergeLocationSpecsTask>> er_upserts = {
             // key 80000: peer_a + peer_b
             {
-                {"kvs#event_report#mem#peer_a:8080",
+                {"kvs#event_report_l2#mem#peer_a:8080",
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
-                {"kvs#event_report#mem#peer_b:8080",
+                {"kvs#event_report_l2#mem#peer_b:8080",
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
             // key 80001: peer_a + peer_b
             {
-                {"kvs#event_report#mem#peer_a:8080",
+                {"kvs#event_report_l2#mem#peer_a:8080",
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
-                {"kvs#event_report#mem#peer_b:8080",
+                {"kvs#event_report_l2#mem#peer_b:8080",
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
             // key 80002: peer_b only
             {
-                {"kvs#event_report#mem#peer_b:8080",
+                {"kvs#event_report_l2#mem#peer_b:8080",
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
             // key 80003: peer_a + peer_b
             {
-                {"kvs#event_report#mem#peer_a:8080",
+                {"kvs#event_report_l2#mem#peer_a:8080",
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
-                {"kvs#event_report#mem#peer_b:8080",
+                {"kvs#event_report_l2#mem#peer_b:8080",
                  DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2,
                  CLS_SERVING,
                  {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},

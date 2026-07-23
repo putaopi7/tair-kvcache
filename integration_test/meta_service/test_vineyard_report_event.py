@@ -995,7 +995,7 @@ class EventReportFunctionalTest(unittest.TestCase):
                     _ev_block_add(key, "mem", _make_single_spec("tp0", uri))
                 )
             self.client.report_event(
-                _make_request(self.instance_id, host, events[:1], trace_id="t16_register")
+                _make_request(instance_id, host, events[:1], trace_id="t16_register")
             )
             self.client.report_event(
                 _make_request(
@@ -1986,6 +1986,14 @@ class EventReportFunctionalTest(unittest.TestCase):
             [_ev_block_snapshot(snapshot_blocks)],
             trace_id="t24_large_initial_snapshot",
         )
+        # Serialize the large request before handing it to the worker.  If the
+        # worker spends its first tens of milliseconds in json.dumps(), the
+        # tiny competing request can otherwise reach KVCM first and make this
+        # concurrency test depend on Python thread scheduling.
+        snapshot_body = json.dumps(snapshot_request)
+        competing_request = dict(snapshot_request)
+        competing_request["trace_id"] = "t24_competing_snapshot"
+        competing_snapshot_body = json.dumps(competing_request)
 
         def send_with_fresh_client(payload, check_ok=True):
             client = KVCMClient(BASE_URL, ADMIN_URL)
@@ -1994,27 +2002,37 @@ class EventReportFunctionalTest(unittest.TestCase):
             finally:
                 client.close()
 
-        with ThreadPoolExecutor(max_workers=24) as pool:
-            snapshot_future = pool.submit(
-                send_with_fresh_client, snapshot_request
-            )
+        def send_preencoded_snapshot(body):
+            client = KVCMClient(BASE_URL, ADMIN_URL)
+            try:
+                response = client.session.post(
+                    f"{BASE_URL}/api/reportEvent", data=body
+                )
+                response.raise_for_status()
+                return response.json()
+            finally:
+                client.close()
 
-            # The large write keeps the full-snapshot gate observable through
-            # the real HTTP/service/manager stack.  A second snapshot must not
-            # enter the write path for the same reporter.
-            time.sleep(0.05)
-            busy = send_with_fresh_client(
-                _make_request(
-                    self.instance_id,
-                    host,
-                    [_ev_block_snapshot([])],
-                    trace_id="t24_competing_snapshot",
-                ),
-                check_ok=False,
-            )
-            self.assertEqual(
-                busy["header"]["status"]["code"],
-                "SNAPSHOT_IN_PROGRESS",
+        with ThreadPoolExecutor(max_workers=24) as pool:
+            # Submit two equivalent large snapshots.  Whichever request reaches
+            # KVCM first may win, but exactly one may commit; the other must be
+            # rejected by the active gate or the post-commit rate limiter.
+            snapshot_futures = [
+                pool.submit(send_preencoded_snapshot, snapshot_body),
+                pool.submit(send_preencoded_snapshot, competing_snapshot_body),
+            ]
+
+            # Do not let a delta win the race before either snapshot has even
+            # reached the backend.  Once one snapshot future completes, either
+            # a token is already committed or that request observed the other
+            # snapshot's active gate; deltas are safe to submit in both cases.
+            first_snapshot_deadline = time.monotonic() + 20
+            while (not any(future.done() for future in snapshot_futures)
+                   and time.monotonic() < first_snapshot_deadline):
+                time.sleep(0.005)
+            self.assertTrue(
+                any(future.done() for future in snapshot_futures),
+                "neither competing snapshot reached a terminal state",
             )
 
             delta_update_uri = _build_event_report_uri(
@@ -2062,7 +2080,28 @@ class EventReportFunctionalTest(unittest.TestCase):
                 for request in gated_requests
             ]
 
-            snapshot_response = snapshot_future.result(timeout=20)
+            snapshot_responses = [
+                future.result(timeout=20) for future in snapshot_futures
+            ]
+            committed = [
+                response for response in snapshot_responses
+                if response.get("header", {}).get("status", {}).get("code") == "OK"
+            ]
+            rejected = [
+                response for response in snapshot_responses
+                if response.get("header", {}).get("status", {}).get("code") != "OK"
+            ]
+            self.assertEqual(len(committed), 1, snapshot_responses)
+            self.assertEqual(len(rejected), 1, snapshot_responses)
+            rejected_code = rejected[0]["header"]["status"]["code"]
+            self.assertIn(
+                rejected_code,
+                ("SNAPSHOT_IN_PROGRESS", "SNAPSHOT_RATE_LIMITED"),
+            )
+            if rejected_code == "SNAPSHOT_RATE_LIMITED":
+                self.assertGreater(int(rejected[0].get("retry_after_ms", 0)), 0)
+
+            snapshot_response = committed[0]
             version = snapshot_response["committed_snapshot_version"]
             self.assertEqual(len(version), 32)
             for future in gated_futures[:3]:

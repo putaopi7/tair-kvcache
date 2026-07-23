@@ -460,7 +460,9 @@ std::string EventReportBackend::BuildLocationId(const std::string &medium, const
 bool EventReportBackend::ParseLocationId(const std::string &location_id,
                                          std::string &out_medium,
                                          std::string &out_host_ip_port) const {
-    return ParseEventReportLocationId(location_id, out_medium, out_host_ip_port);
+    std::string storage_type;
+    return ParseEventReportLocationId(location_id, storage_type, out_medium, out_host_ip_port) &&
+           storage_type == ToString(config_.type());
 }
 
 std::string EventReportBackend::HostSuffix(const std::string &host_ip_port) const { return "#" + host_ip_port; }

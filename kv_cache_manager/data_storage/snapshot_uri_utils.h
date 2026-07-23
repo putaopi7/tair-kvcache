@@ -9,7 +9,6 @@
 namespace kv_cache_manager {
 
 inline constexpr const char *KVCM_SNAPSHOT_VERSION_PARAM = "s_version";
-inline constexpr const char *KVCM_EVENT_REPORT_LOCATION_PREFIX = "kvs#event_report#";
 
 // Identifies the one reporter whose complete cache set is replaced together.
 // This is an implementation key for versioning and mutual exclusion, not a
@@ -104,29 +103,37 @@ inline bool AddSnapshotVersionToUri(const std::string &raw_uri, const std::strin
     return !out_uri.empty();
 }
 
-inline std::string BuildEventReportLocationId(const std::string &medium, const std::string &host_ip_port) {
-    std::string result(KVCM_EVENT_REPORT_LOCATION_PREFIX);
-    result.reserve(result.size() + medium.size() + host_ip_port.size() + 1);
-    result.append(medium);
-    result.push_back('#');
-    result.append(host_ip_port);
-    return result;
+inline bool ParseEventReportLocationId(const std::string &location_id,
+                                       std::string &out_storage_type,
+                                       std::string &out_medium,
+                                       std::string &out_host_ip_port) {
+    constexpr const char *root_prefix = "kvs#";
+    constexpr size_t root_prefix_size = 4;
+    if (location_id.size() <= root_prefix_size || location_id.compare(0, root_prefix_size, root_prefix) != 0) {
+        return false;
+    }
+    const size_t type_end = location_id.find('#', root_prefix_size);
+    if (type_end == std::string::npos || type_end == root_prefix_size) {
+        return false;
+    }
+    out_storage_type = location_id.substr(root_prefix_size, type_end - root_prefix_size);
+    if (out_storage_type != "event_report_l1p5" && out_storage_type != "event_report_l2") {
+        return false;
+    }
+    const size_t medium_begin = type_end + 1;
+    const size_t separator = location_id.find('#', medium_begin);
+    if (separator == std::string::npos || separator == medium_begin || separator + 1 >= location_id.size()) {
+        return false;
+    }
+    out_medium = location_id.substr(medium_begin, separator - medium_begin);
+    out_host_ip_port = location_id.substr(separator + 1);
+    return !out_host_ip_port.empty() && out_host_ip_port.find('#') == std::string::npos;
 }
 
 inline bool
 ParseEventReportLocationId(const std::string &location_id, std::string &out_medium, std::string &out_host_ip_port) {
-    const size_t prefix_size = std::char_traits<char>::length(KVCM_EVENT_REPORT_LOCATION_PREFIX);
-    if (location_id.size() <= prefix_size ||
-        location_id.compare(0, prefix_size, KVCM_EVENT_REPORT_LOCATION_PREFIX, prefix_size) != 0) {
-        return false;
-    }
-    const size_t separator = location_id.find('#', prefix_size);
-    if (separator == std::string::npos || separator == prefix_size || separator + 1 >= location_id.size()) {
-        return false;
-    }
-    out_medium = location_id.substr(prefix_size, separator - prefix_size);
-    out_host_ip_port = location_id.substr(separator + 1);
-    return !out_host_ip_port.empty() && out_host_ip_port.find('#') == std::string::npos;
+    std::string storage_type;
+    return ParseEventReportLocationId(location_id, storage_type, out_medium, out_host_ip_port);
 }
 
 } // namespace kv_cache_manager

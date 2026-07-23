@@ -1591,7 +1591,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     auto event_backend_holder = LookupEventReportBackend(registry_manager_, instance_id, requested_type);
-    auto *event_backend = dynamic_cast<EventReportBackend *>(event_backend_holder.get());
+    auto event_backend = std::dynamic_pointer_cast<EventReportBackend>(event_backend_holder);
     if (!event_backend) {
         KVCM_LOG_WARN("trace_id [%s] | ReportEvent: EventReportBackend not found for instance [%s] type [%d]",
                       trace_id.c_str(),
@@ -2105,7 +2105,11 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     if (!snapshot_commit_tasks.empty()) {
         const auto &task = snapshot_commit_tasks.front();
         bool snapshot_failed = per_item_ec[task.event_index] != EC_OK;
-        if (!snapshot_failed && !meta_searcher->Sync(task.block_keys)) {
+        // An empty snapshot is a valid authoritative "reporter owns no blocks"
+        // update.  With no block writes there is nothing to flush before the
+        // in-memory token is published; stale locations are removed by the
+        // cleanup task below.
+        if (!snapshot_failed && !task.block_keys.empty() && !meta_searcher->Sync(task.block_keys)) {
             KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: failed to sync host [%s] token [%s]",
                           trace_id.c_str(),
                           task.reporter_key.host_ip_port.c_str(),
